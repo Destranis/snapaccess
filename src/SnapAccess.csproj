@@ -1,0 +1,145 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>SnapAccess</AssemblyName>
+    <RootNamespace>SnapAccess</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="decompiled_SnapAccess\**" />
+    <Compile Remove="templates\**" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <MelonAssemblies>C:\Program Files (x86)\Steam\steamapps\common\MARVEL SNAP\MelonLoader\net6</MelonAssemblies>
+    <Il2CppAssemblies>C:\Program Files (x86)\Steam\steamapps\common\MARVEL SNAP\MelonLoader\Il2CppAssemblies</Il2CppAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MelonLoader References -->
+    <Reference Include="MelonLoader">
+      <HintPath>$(MelonAssemblies)\MelonLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(MelonAssemblies)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(MelonAssemblies)\Il2CppInterop.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Base Il2Cpp / Unity References -->
+    <Reference Include="Il2Cppmscorlib">
+      <HintPath>$(Il2CppAssemblies)\Il2Cppmscorlib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSystem">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.UIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(Il2CppAssemblies)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.LocalizationModule">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.LocalizationModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(Il2CppAssemblies)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Marvel Snap Specific Assemblies -->
+    <Reference Include="Il2CppApp.Game">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Tutorials">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Tutorials.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.View">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.View.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Navigator">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Navigator.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Localization">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Localization.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppUi">
+      <HintPath>$(Il2CppAssemblies)\Il2CppUi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.CubeGame.Logic">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.CubeGame.Logic.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.CubeGame">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.CubeGame.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.CubeDef">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.CubeDef.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.CubeRendering.Card">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.CubeRendering.Card.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Localization">
+      <HintPath>$(Il2CppAssemblies)\Unity.Localization.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Vfx">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Vfx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Event">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Event.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIElementsModule">
+      <HintPath>$(Il2CppAssemblies)\UnityEngine.UIElementsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="CopyToMods" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="C:\Program Files (x86)\Steam\steamapps\common\MARVEL SNAP\Mods\" />
+    <Message Text="Copied $(TargetFileName) to MelonLoader Mods folder" Importance="High" />
+  </Target>
+
+</Project>

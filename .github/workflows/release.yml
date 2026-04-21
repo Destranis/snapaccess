@@ -1,0 +1,40 @@
+﻿name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Package User Mod Files
+        run: |
+          mkdir -p package_mod
+          cp SnapAccess.dll package_mod/
+          cp SDL3.dll package_mod/
+          cp Tolk.dll package_mod/
+          cp nvdaControllerClient64.dll package_mod/
+          cp README.md package_mod/
+          cd package_mod && zip -r ../snapaccess.zip .
+
+      - name: Package Source Code
+        run: |
+          mkdir -p package_src
+          cp -r src package_src/
+          cp .gitignore package_src/
+          cp README.md package_src/
+          cd package_src && zip -r ../snapaccess_src.zip .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            snapaccess.zip
+            snapaccess_src.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
