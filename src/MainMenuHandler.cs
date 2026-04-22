@@ -1,207 +1,139 @@
-using System;
+﻿using System;
+using System.Collections;
 using System.Collections.Generic;
-using Il2CppCubeUnity.App.Game;
-using Il2CppCubeUnity.App.Navigator;
-using Il2CppCubeUnity.App.View;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
+using Il2CppCubeUnity.App.Navigator;
 using Il2CppSecondDinner.CubeRendering.Card;
 using Il2CppTMPro;
 using UnityEngine;
 using UnityEngine.UI;
 using Object = UnityEngine.Object;
+using MelonLoader;
 
 namespace SnapAccess;
 
 /// <summary>
-/// Handles the main menu. Provides structured navigation for the Play screen
-/// (deck info + play button) and generic button navigation for other sections.
-/// Tab switches between menu bar and screen content. Backspace goes back.
+/// Manages navigation within the main menu hub.
 /// </summary>
-public class MainMenuHandler
+public class MainMenuHandler : IHandler
 {
 	private class MenuEntry
 	{
-		public string Name;
 		public string LocKey;
-		public Func<Navigator, NavigatorButton> GetButton;
 		public Action<Navigator> Activate;
 	}
 
 	private Navigator _navigator;
 	private int _focusIndex = -1;
 	private bool _wasShown = false;
-	private float _lastSearchTime = 0f;
 	private bool _inSubScreen = false;
 	private float _inputBlockUntil = 0f;
 	private readonly DialogHandler _dialogHandler;
+	private readonly FriendlyMatchHandler _friendlyMatchHandler;
+	private readonly MissionsHandler _missionsHandler;
 
-	// Play screen state
+	// --- Play screen state ---
 	private Button _playButton;
 	private Button _deckLeftButton;
 	private Button _deckRightButton;
 	private string _deckName = "";
 	private bool _onPlayScreen = false;
 
-	// Deck card browsing
-	private bool _browsingDeck = false;
-	private readonly List<CardView> _deckCards = new List<CardView>();
-	private int _deckCardIndex = -1;
-	private int _deckDetailLevel = 0;
-
-	// Missions menu browsing
-	private bool _browsingMissions = false;
-	private int _missionMenuLevel = 0; // 0 = categories, 1 = individual missions
-	private readonly List<MissionCategory> _missionCategories = new List<MissionCategory>();
-	private int _missionCategoryIndex = 0;
-	private int _missionIndex = 0;
-	private int _missionDetailLevel = 0; // 0 = name, 1 = description, 2 = progress, 3 = reward
-
-	private class MissionInfo
-	{
-		public string Title;
-		public string Progress;
-		public string Goal;
-		public string Description;
-		public string Reward;
-		public Button TileButton;
-	}
-
-	private class MissionCategory
-	{
-		public string Name;
-		public readonly List<MissionInfo> Missions = new List<MissionInfo>();
-	}
-
-	// Rewards menu browsing
-	private bool _browsingRewards = false;
-	private int _rewardMenuLevel = 0; // 0 = categories, 1 = individual rewards
-	private readonly List<RewardCategory> _rewardCategories = new List<RewardCategory>();
-	private int _rewardCategoryIndex = 0;
-	private int _rewardIndex = 0;
-
-	private class RewardItem
-	{
-		public string Label;
-		public Button ClaimButton;
-		public bool Claimable;
-	}
-
-	private class RewardCategory
-	{
-		public string Name;
-		public readonly List<RewardItem> Rewards = new List<RewardItem>();
-	}
-
-	// Collection browsing
+	// --- Collection browsing state ---
 	private bool _browsingCollection = false;
+	private int _collectionLevel = 0; // 0 = categories, 1 = items inside category
 	private readonly List<CollectionCard> _collectionCards = new List<CollectionCard>();
 	private int _collectionIndex = 0;
 	private int _collectionDetailLevel = 0;
-	private bool _returnToCollection = false;
-	private bool _returnToPlayScreen = false;
 	private readonly List<string> _collectionSections = new List<string>();
 	private int _collectionSectionIndex = 0;
+	private bool _deckActionMode = false;
+
+	// --- Game Modes state ---
+	private bool _inGameModes = false;
+	private readonly List<GameModeEntry> _gameModeEntries = new List<GameModeEntry>();
+	private int _gameModeIndex = 0;
+
+	private class GameModeEntry
+	{
+		public string Name;
+		public bool IsLocked;
+		public string LockReason;
+		public Button Button; // null if locked (no Button component)
+		public GameObject GameObject;
+	}
 
 	private class CollectionCard
 	{
 		public string Name;
 		public Button Button;
 		public CardRenderer Renderer;
+		public bool IsDeckSlot;
 	}
 
-	// Pending collection scan (delayed to allow screen render)
-	private bool _pendingCollectionScan = false;
-	private float _collectionScanTime = 0f;
+	// --- Reward browsing state ---
+	private bool _browsingRewards = false;
+	private bool _browsingRewardDetails = false;
+	private readonly List<RewardEvent> _rewardEvents = new List<RewardEvent>();
+	private readonly List<RewardDay> _rewardDays = new List<RewardDay>();
+	private int _rewardIndex = 0;
+	private int _rewardDayIndex = 0;
 
-	public MainMenuHandler(DialogHandler dialogHandler)
+	private class RewardEvent
+	{
+		public string EventName;
+		public string NextRewardDay;
+		public string NextRewardCountdown; // empty = ready now
+		public string FinalRewardDay;
+		public string EventEndTime;
+		public string ExtraInfo; // card name, boosters, etc.
+		public Button SeeAllButton;
+	}
+
+	private class RewardDay
+	{
+		public string Day;
+		public string Reward; // "155 Credits", "Series 3 Pack", card name, title name
+		public string Countdown; // empty = claimable now or already claimed
+		public bool IsClaimable; // label starts with "Claim"
+		public Button ClaimButton;
+	}
+
+	// --- Start button state ---
+	private string _startButtonLabel = "Start Game";
+
+	private readonly List<MenuEntry> _entries = new List<MenuEntry>();
+
+	public MainMenuHandler(DialogHandler dialogHandler, FriendlyMatchHandler friendlyMatchHandler, MissionsHandler missionsHandler)
 	{
 		_dialogHandler = dialogHandler;
+		_friendlyMatchHandler = friendlyMatchHandler;
+		_missionsHandler = missionsHandler;
+		InitializeEntries();
 	}
 
-	private readonly List<MenuEntry> _entries = new List<MenuEntry>
+	private void InitializeEntries()
 	{
-		new MenuEntry
-		{
-			Name = "News",
-			LocKey = "menu_news",
-			GetButton = (Navigator nav) => nav._NewsButton,
-			Activate = delegate(Navigator nav) { nav.OnNewsButton(); }
-		},
-		new MenuEntry
-		{
-			Name = "Shop",
-			LocKey = "menu_shop",
-			GetButton = (Navigator nav) => nav._ShopButton,
-			Activate = delegate(Navigator nav) { nav.OnShopButton(); }
-		},
-		new MenuEntry
-		{
-			Name = "Play",
-			LocKey = "menu_play",
-			GetButton = (Navigator nav) => nav._PlayButton,
-			Activate = delegate(Navigator nav) { nav.OnPlayButton(); }
-		},
-		new MenuEntry
-		{
-			Name = "Collection",
-			LocKey = "menu_collection",
-			GetButton = (Navigator nav) => nav._CollectionButton,
-			Activate = delegate(Navigator nav) { nav.OnCollectionButton(); }
-		},
-		new MenuEntry
-		{
-			Name = "Game Modes",
-			LocKey = "menu_game_modes",
-			GetButton = (Navigator nav) => nav._GameModeButton,
-			Activate = delegate(Navigator nav) { nav.OnGameModesButton(); }
-		},
-		new MenuEntry
-		{
-			Name = "Clan",
-			LocKey = "menu_clan",
-			GetButton = (Navigator nav) => nav._ClanButton,
-			Activate = delegate(Navigator nav) { nav.OnClanButton(); }
-		},
-		new MenuEntry
-		{
-			Name = "Settings",
-			LocKey = "menu_settings",
-			GetButton = null, // Not a Navigator button — standalone UI button
-			Activate = delegate(Navigator nav) { ActivateSettingsButton(); }
-		}
-	};
-
-	private static void ActivateSettingsButton()
-	{
-		try
-		{
-			Il2CppArrayBase<Button> buttons = Object.FindObjectsOfType<Button>();
-			if (buttons == null) return;
-			for (int i = 0; i < buttons.Count; i++)
-			{
-				Button btn = buttons[i];
-				if ((Object)(object)btn == (Object)null) continue;
-				if (!((Component)btn).gameObject.activeInHierarchy) continue;
-				string goName = ((Object)((Component)btn).gameObject).name;
-				if (goName == "Button_Settings")
-				{
-					UIHelper.ClickButton(btn);
-					DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Settings button clicked");
-					return;
-				}
-			}
-			ScreenReader.Say(Loc.Get("menu_settings_not_found"));
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ActivateSettingsButton failed: " + ex.Message);
-		}
+		_entries.Add(new MenuEntry { LocKey = "menu_news", Activate = n => n.OnNewsButton() });
+		_entries.Add(new MenuEntry { LocKey = "menu_shop", Activate = n => n.OnShopButton() });
+		_entries.Add(new MenuEntry { LocKey = "menu_play", Activate = n => n.OnPlayButton() });
+		_entries.Add(new MenuEntry { LocKey = "menu_collection", Activate = n => n.OnCollectionButton() });
+		_entries.Add(new MenuEntry { LocKey = "menu_game_modes", Activate = n => n.OnGameModesButton() });
+		_entries.Add(new MenuEntry { LocKey = "menu_clan", Activate = n => {
+            Button b = FindButtonByName("Btn_Clans");
+            if (b != null)
+            {
+                ScreenReader.Say("Opening Alliances");
+                UIHelper.ClickButton(b);
+                _inSubScreen = true;
+                _dialogHandler.ResetWithDelay(0.8f);
+            }
+        } });
 	}
 
 	public bool IsActive => (Object)(object)_navigator != (Object)null && IsNavigatorVisible();
 
-	/// <summary>Whether the user is in sub-screen mode (not navigating the menu bar).</summary>
-	public bool InSubScreen => _inSubScreen && !_onPlayScreen && !_browsingDeck && !_browsingMissions && !_browsingRewards && !_browsingCollection;
+	public bool InSubScreen => _inSubScreen && !_onPlayScreen && !_browsingCollection && !_inGameModes;
 
 	public bool Update()
 	{
@@ -211,2275 +143,1602 @@ public class MainMenuHandler
 		if (visible && !_wasShown) OnNavigatorShown();
 		else if (!visible && _wasShown) OnNavigatorHidden();
 		_wasShown = visible;
+
 		if (!visible) return false;
 
-		// Handle delayed collection scan
-		if (_pendingCollectionScan && Time.time >= _collectionScanTime)
-		{
-			_pendingCollectionScan = false;
-			EnterCollection();
-		}
+		bool consumed = ProcessInput();
 
-		ProcessInput();
-
-		// On Play screen, we handle everything ourselves — block DialogHandler
-		if (_onPlayScreen || _browsingDeck || _browsingMissions || _browsingRewards || _browsingCollection) return true;
-
-		// On other screens in sub-screen mode, let DialogHandler run
-		return false;
+		if (_onPlayScreen || _browsingCollection || _browsingRewards || _browsingRewardDetails || _inGameModes) return true;
+		return consumed;
 	}
 
-	public void AnnounceContext()
+	/// <summary>Returns true if input was consumed and no other handler should process it.</summary>
+	private bool ProcessInput()
 	{
-		if (_onPlayScreen)
-		{
-			AnnouncePlayScreen();
-		}
-		else if (_focusIndex >= 0 && _focusIndex < _entries.Count)
-		{
-			MenuEntry entry = _entries[_focusIndex];
-			string current = IsButtonActive(entry) ? Loc.Get("menu_current") : "";
-			ScreenReader.Say(Loc.Get("menu_context", Loc.Get(entry.LocKey), _focusIndex + 1, _entries.Count, current));
-		}
-		else
-		{
-			ScreenReader.Say(Loc.Get("menu_help"));
-		}
-	}
+		if (Time.time < _inputBlockUntil) return false;
 
-	public void Reset()
-	{
-		_navigator = null;
-		_focusIndex = -1;
-		_wasShown = false;
-		_inSubScreen = false;
-		_onPlayScreen = false;
-		_browsingDeck = false;
-		_browsingMissions = false;
-		_browsingRewards = false;
-		_browsingCollection = false;
-		_returnToCollection = false;
-		_returnToPlayScreen = false;
-		_playButton = null;
-		_deckLeftButton = null;
-		_deckRightButton = null;
-		_deckName = "";
-	}
-
-	// --- Navigator Management ---
-
-	private bool FindNavigator()
-	{
-		if ((Object)(object)_navigator != (Object)null)
-		{
-			try
-			{
-				if ((Object)(object)((Component)_navigator).gameObject != (Object)null)
-					return true;
-			}
-			catch { }
-			_navigator = null;
-		}
-		if (Time.time - _lastSearchTime < 1f) return false;
-		_lastSearchTime = Time.time;
-		try
-		{
-			_navigator = UIHelper.FindComponent<Navigator>();
-			if ((Object)(object)_navigator != (Object)null)
-			{
-				DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Navigator found");
-				return true;
-			}
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Navigator search failed: " + ex.Message);
-		}
-		return false;
-	}
-
-	private bool IsNavigatorVisible()
-	{
-		if ((Object)(object)_navigator == (Object)null) return false;
-		try { return _navigator.IsShown && ((Component)_navigator).gameObject.activeInHierarchy; }
-		catch { return false; }
-	}
-
-	private void OnNavigatorShown()
-	{
-		DebugLogger.Log(LogCategory.State, "MainMenuHandler", "Navigator visible — entering main menu");
-		AccessStateManager.TryEnter(AccessStateManager.State.MainMenu);
-		_focusIndex = 2; // Play
-		_inputBlockUntil = Time.time + 0.5f; // Block input briefly to prevent phantom keypresses on scene load
-
-		// Detect current section and enter it
-		string section = GetCurrentSectionName();
-		if (section == "Play" || string.IsNullOrEmpty(section) || section == "None")
-		{
-			// Go straight to Play screen — its announcement is sufficient
-			EnterPlayScreen();
-		}
-		else
-		{
-			_inSubScreen = true;
-			_onPlayScreen = false;
-			_dialogHandler.Reset();
-			// Only announce menu + section for non-Play screens
-			ScreenReader.Say(Loc.Get("menu_opened"));
-			ScreenReader.SayQueued(Loc.Get("menu_current_section", section));
-		}
-	}
-
-	private void OnNavigatorHidden()
-	{
-		DebugLogger.Log(LogCategory.State, "MainMenuHandler", "Navigator hidden");
-		AccessStateManager.Exit(AccessStateManager.State.MainMenu);
-		_inSubScreen = false;
-		_onPlayScreen = false;
-		_browsingDeck = false;
-		_browsingMissions = false;
-		_browsingRewards = false;
-		_browsingCollection = false;
-		_returnToCollection = false;
-		_returnToPlayScreen = false;
-	}
-
-	// --- Input Processing ---
-
-	private void ProcessInput()
-	{
-		// Block input briefly after scene transition to prevent phantom keypresses
-		if (Time.time < _inputBlockUntil) return;
-
-		// Deck and missions browsing take priority
-		if (_browsingDeck)
-		{
-			ProcessDeckInput();
-			return;
-		}
-		if (_browsingMissions)
-		{
-			ProcessMissionsInput();
-			return;
-		}
-		if (_browsingRewards)
-		{
-			ProcessRewardsInput();
-			return;
-		}
-		if (_browsingCollection)
-		{
-			ProcessCollectionInput();
-			return;
-		}
-
-		// Backspace: exit sub-screen → menu bar (or back to collection if we came from there)
+		// Backspace always exits current level — checked first so it works everywhere
 		if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
 		{
-			if (_inSubScreen && _returnToPlayScreen)
-			{
-				// Return to play screen after deck selector — rescan to pick up new deck name
-				_inSubScreen = false;
-				_returnToPlayScreen = false;
-				TryClickGameBackButton();
-				// Delay re-entry to allow the deck tray to close
-				_inputBlockUntil = Time.time + 0.5f;
-				EnterPlayScreen();
-			}
-			else if (_inSubScreen && _returnToCollection)
-			{
-				// Return to collection browsing after viewing a card detail
-				_inSubScreen = false;
-				_returnToCollection = false;
-				_browsingCollection = true;
-				_collectionDetailLevel = 0;
-				ScreenReader.Say(Loc.Get("collection_entered", _collectionCards.Count));
-				AnnounceCollectionCard();
-			}
-			else if (_inSubScreen)
-			{
-				// Click the game's Escape/Back button to actually close the sub-screen
-				TryClickGameBackButton();
-				_inSubScreen = false;
-				_returnToCollection = false;
-				ScreenReader.Say(Loc.Get("menu_nav_focus"));
-				AnnounceFocused();
-			}
-			else if (_onPlayScreen)
-			{
-				_onPlayScreen = false;
-				ScreenReader.Say(Loc.Get("menu_nav_focus"));
-				AnnounceFocused();
-			}
+			HandleBackCommand();
+			return true;
+		}
+
+		if (_browsingRewardDetails) { ProcessRewardDetailsInput(); return true; }
+		if (_browsingRewards) { ProcessRewardsInput(); return true; }
+		if (_browsingCollection) { ProcessCollectionInput(); return true; }
+		if (_inGameModes) { ProcessGameModesInput(); return true; }
+		if (_onPlayScreen) { ProcessPlayInput(); return true; }
+		if (_inSubScreen) return false; // Let DialogHandler handle arrows/Enter
+
+		HandleMenuBarInput();
+		return false;
+	}
+
+	private void HandleBackCommand()
+	{
+		// Deactivate any sub-handlers first
+		_friendlyMatchHandler.Reset();
+		_missionsHandler.Reset();
+
+		if (_browsingRewardDetails)
+		{
+			_browsingRewardDetails = false;
+			_rewardDays.Clear();
+			// Click the back button on the reward detail screen
+			TryClickRewardDetailBackButton();
+			_browsingRewards = true;
+			ScreenReader.Say("Back to reward events.");
+			AnnounceReward();
 			return;
 		}
 
-		// Tab: toggle menu bar vs screen content
-		if (SDLInput.IsKeyDown(SDLInput.Key.Tab))
+		if (_browsingRewards)
 		{
-			if (_inSubScreen || _onPlayScreen)
-			{
-				_inSubScreen = false;
-				_onPlayScreen = false;
-				ScreenReader.Say(Loc.Get("menu_nav_focus"));
-				AnnounceFocused();
-			}
-			else
-			{
-				EnterCurrentSection();
-			}
+			_browsingRewards = false;
+			AnnouncePlayCategory();
 			return;
 		}
 
-		// On Play screen
-		if (_onPlayScreen)
+		if (_browsingCollection)
 		{
-			ProcessPlayInput();
-			return;
+			if (_collectionLevel == 1)
+			{
+				// Back from items to category list
+				_collectionLevel = 0;
+				ScreenReader.Say(_collectionSections[_collectionSectionIndex] + ", " + (_collectionSectionIndex + 1) + " of " + _collectionSections.Count);
+				return;
+			}
+			_browsingCollection = false;
+			_deckActionMode = false;
+			_inSubScreen = false;
+			TryClickGameBackButton();
+			ScreenReader.Say("Exiting collection.");
+			AnnounceFocused();
 		}
+		else if (_inGameModes)
+		{
+			_inGameModes = false;
+			_inSubScreen = false;
+			ScreenReader.Say(Loc.Get("menu_nav_focus"));
+			AnnounceFocused();
+		}
+		else if (_inSubScreen)
+		{
+			TryClickGameBackButton();
+			_inSubScreen = false;
+			ScreenReader.Say(Loc.Get("menu_nav_focus"));
+			AnnounceFocused();
+		}
+		else if (_onPlayScreen)
+		{
+			_onPlayScreen = false;
+			ScreenReader.Say(Loc.Get("menu_nav_focus"));
+			AnnounceFocused();
+		}
+	}
 
-		// In sub-screen on non-Play section — let DialogHandler handle it
-		if (_inSubScreen) return;
-
-		// Menu bar navigation
-		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-		{
-			MoveFocus(-1);
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-		{
-			MoveFocus(1);
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
-		{
-			ActivateFocused();
-		}
+	private void HandleMenuBarInput()
+	{
+		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MoveFocus(-1);
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveFocus(1);
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South)) ActivateFocused();
 		else
 		{
-			// Number keys 1-6
 			for (int i = 0; i < _entries.Count && i < 6; i++)
 			{
-				if (SDLInput.IsKeyDown((SDLInput.Key)(49 + i)))
-				{
-					_focusIndex = i;
-					ActivateFocused();
-					return;
-				}
+				if (SDLInput.IsKeyDown((SDLInput.Key)(49 + i))) { _focusIndex = i; ActivateFocused(); return; }
 			}
 		}
 	}
 
-	private void EnterCurrentSection()
+	private void MoveFocus(int dir)
 	{
-		if (_focusIndex == 2) // Play
-		{
-			EnterPlayScreen();
-		}
-		else if (_focusIndex == 3) // Collection
-		{
-			EnterCollection();
-		}
-		else
-		{
-			_inSubScreen = true;
-			_onPlayScreen = false;
-			_dialogHandler.Reset();
-			ScreenReader.Say(Loc.Get("menu_content_focus"));
-		}
-	}
-
-	// --- Menu Bar ---
-
-	private void MoveFocus(int direction)
-	{
-		int old = _focusIndex;
-		_focusIndex += direction;
-		if (_focusIndex >= _entries.Count) _focusIndex = 0;
-		else if (_focusIndex < 0) _focusIndex = _entries.Count - 1;
-		if (_focusIndex != old) AnnounceFocused();
-	}
-
-	private void ActivateFocused()
-	{
-		if (_focusIndex < 0 || _focusIndex >= _entries.Count) return;
-
-		MenuEntry entry = _entries[_focusIndex];
-		if (IsButtonLocked(entry))
-		{
-			ScreenReader.Say(Loc.Get("menu_locked", Loc.Get(entry.LocKey), _focusIndex + 1, _entries.Count));
-			return;
-		}
-		try
-		{
-			DebugLogger.LogInput("Enter", "Activating menu: " + entry.Name);
-			entry.Activate(_navigator);
-
-			if (_focusIndex == 2) // Play
-			{
-				EnterPlayScreen();
-			}
-			else if (_focusIndex == 3) // Collection
-			{
-				ScreenReader.Say(Loc.Get("menu_activated", Loc.Get(entry.LocKey)));
-				// Delay collection scan to allow the screen to render (needs ~2-3s)
-				_pendingCollectionScan = true;
-				_collectionScanTime = Time.time + 2.5f;
-			}
-			else
-			{
-				_inSubScreen = true;
-				_onPlayScreen = false;
-				// Settings opens in Canvas-Dialogs which takes a moment to render
-				_dialogHandler.ResetWithDelay(0.6f);
-				ScreenReader.Say(Loc.Get("menu_activated", Loc.Get(entry.LocKey)));
-			}
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Activate failed: " + ex.Message);
-			ScreenReader.Say(Loc.Get("menu_error"));
-		}
+		_focusIndex = (_focusIndex + dir + _entries.Count) % _entries.Count;
+		AnnounceFocused();
 	}
 
 	private void AnnounceFocused()
 	{
 		if (_focusIndex < 0 || _focusIndex >= _entries.Count) return;
-		MenuEntry entry = _entries[_focusIndex];
-		string name = Loc.Get(entry.LocKey);
-		if (IsButtonLocked(entry))
-			ScreenReader.Say(Loc.Get("menu_locked", name, _focusIndex + 1, _entries.Count));
-		else if (IsButtonActive(entry))
-			ScreenReader.Say(Loc.Get("menu_button_active", name, _focusIndex + 1, _entries.Count));
-		else
-			ScreenReader.Say(Loc.Get("menu_button", name, _focusIndex + 1, _entries.Count));
+		var entry = _entries[_focusIndex];
+		ScreenReader.Say(Loc.Get(entry.LocKey) + ", " + (_focusIndex + 1) + " of " + _entries.Count);
 	}
 
-	private bool IsButtonLocked(MenuEntry entry)
+	private void ActivateFocused()
 	{
-		if (entry.GetButton == null) return false;
-		try
-		{
-			NavigatorButton btn = entry.GetButton(_navigator);
-			return (Object)(object)btn != (Object)null && btn._locked;
-		}
-		catch { return false; }
+		if (_focusIndex < 0 || _focusIndex >= _entries.Count) return;
+		var entry = _entries[_focusIndex];
+		ScreenReader.Say(Loc.Get("menu_activated", Loc.Get(entry.LocKey)));
+		entry.Activate(_navigator);
+		EnterCurrentSection();
 	}
 
-	private bool IsButtonActive(MenuEntry entry)
+	private void EnterCurrentSection()
 	{
-		if (entry.GetButton == null) return false;
-		try
-		{
-			NavigatorButton btn = entry.GetButton(_navigator);
-			if ((Object)(object)btn == (Object)null) return false;
-			GameObject highlight = btn._HighlightObject;
-			return (Object)(object)highlight != (Object)null && highlight.activeInHierarchy;
-		}
-		catch { return false; }
-	}
-
-	private string GetCurrentSectionName()
-	{
-		try { return ((object)_navigator.CurrentSubScene).ToString(); }
-		catch { return ""; }
+		if (_focusIndex < 0 || _focusIndex >= _entries.Count) return;
+		string key = _entries[_focusIndex].LocKey;
+		if (key == "menu_play") EnterPlayScreen();
+		else if (key == "menu_collection") EnterCollection();
+		else if (key == "menu_game_modes") EnterGameModes();
+		else { _inSubScreen = true; _dialogHandler.ResetWithDelay(0.5f); }
 	}
 
 	// --- Play Screen ---
+
+	private enum PlayMenuCategory { StartGame, SelectDeck, EditDeck, Missions, Rewards, GameInfo }
+	private PlayMenuCategory _playCategory = PlayMenuCategory.StartGame;
+	private const int _playMenuCount = 6;
 
 	private void EnterPlayScreen()
 	{
 		_onPlayScreen = true;
 		_inSubScreen = false;
-		_browsingDeck = false;
+		_playCategory = PlayMenuCategory.StartGame;
 		ScanPlayScreen();
-		AnnouncePlayScreen();
-	}
-
-	private void ScanPlayScreen()
-	{
-		_playButton = null;
-		_deckLeftButton = null;
-		_deckRightButton = null;
-		_deckName = "";
-
-		try
-		{
-			Il2CppArrayBase<Button> allButtons = Object.FindObjectsOfType<Button>();
-			if (allButtons != null)
-			{
-				for (int i = 0; i < allButtons.Count; i++)
-				{
-					Button btn = allButtons[i];
-					if ((Object)(object)btn == (Object)null) continue;
-					if (!((Component)btn).gameObject.activeInHierarchy) continue;
-					if (!((Selectable)btn).interactable) continue;
-					try
-					{
-						string goName = ((Object)((Component)btn).gameObject).name;
-						if (goName == "btn_start" || goName == "PlayButton" ||
-						    goName.Contains("btn_play", StringComparison.OrdinalIgnoreCase))
-						{
-							_playButton = btn;
-							DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Play button found: " + goName);
-						}
-						else if (goName == "btn_left")
-						{
-							// Deck selection — previous deck
-							_deckLeftButton = btn;
-							// btn_left's label IS the deck name
-							string label = UIHelper.GetButtonLabel(btn);
-							if (!string.IsNullOrEmpty(label) && label.Length >= 2 && !IsNumericLabel(label))
-							{
-								_deckName = label;
-								DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Deck name from btn_left: " + _deckName);
-							}
-						}
-						else if (goName == "btn_right")
-						{
-							// Deck selection — next deck
-							_deckRightButton = btn;
-						}
-					}
-					catch { }
-				}
-			}
-
-			// Fallback: find deck name from text near deck-related parent
-			if (string.IsNullOrEmpty(_deckName))
-			{
-				Il2CppArrayBase<TMP_Text> allTexts = Object.FindObjectsOfType<TMP_Text>();
-				if (allTexts != null)
-				{
-					for (int i = 0; i < allTexts.Count; i++)
-					{
-						TMP_Text tmp = allTexts[i];
-						if ((Object)(object)tmp == (Object)null) continue;
-						if (!((Component)tmp).gameObject.activeInHierarchy) continue;
-						string text = tmp.text;
-						if (string.IsNullOrWhiteSpace(text)) continue;
-
-						try
-						{
-							Transform t = ((Component)tmp).transform;
-							int depth = 0;
-							while (t != null && depth < 5)
-							{
-								string parentName = ((Object)t.gameObject).name;
-								if (parentName.Contains("Deck", StringComparison.OrdinalIgnoreCase))
-								{
-									string cleaned = UIHelper.StripRichText(text.Trim());
-									if (cleaned.Length >= 3 && !IsNumericLabel(cleaned) && !IsPromoText(cleaned))
-									{
-										_deckName = cleaned;
-										DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Deck name found: " + _deckName);
-									}
-									break;
-								}
-								t = t.parent;
-								depth++;
-							}
-						}
-						catch { }
-						if (!string.IsNullOrEmpty(_deckName)) break;
-					}
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ScanPlayScreen failed: " + ex.Message);
-		}
-	}
-
-	private void AnnouncePlayScreen()
-	{
-		string msg = Loc.Get("play_screen");
-		if (!string.IsNullOrEmpty(_deckName))
-		{
-			msg += " " + Loc.Get("play_deck", _deckName);
-		}
-		// Read rank info
-		string rank = ReadRankText();
-		if (!string.IsNullOrEmpty(rank))
-			msg += " " + rank;
-
-		bool canSwitch = (Object)(object)_deckLeftButton != (Object)null;
-		msg += " " + (canSwitch ? Loc.Get("play_instructions_full") : Loc.Get("play_instructions"));
-		ScreenReader.Say(msg);
-	}
-
-	/// <summary>Opens the missions menu for structured browsing.</summary>
-	private void OpenMissionsMenu()
-	{
-		ScanMissions();
-		if (_missionCategories.Count == 0)
-		{
-			ScreenReader.Say(Loc.Get("play_no_missions"));
-			return;
-		}
-		_browsingMissions = true;
-		_missionMenuLevel = 0;
-		_missionCategoryIndex = 0;
-		_missionIndex = 0;
-		_missionDetailLevel = 0;
-		ScreenReader.Say(Loc.Get("missions_menu_opened", _missionCategories.Count));
-		AnnounceMissionCategory();
-	}
-
-	/// <summary>Scans mission tiles from the Play screen and groups them by category.</summary>
-	private void ScanMissions()
-	{
-		_missionCategories.Clear();
-		try
-		{
-			// Find category panels under the missions layout
-			Il2CppArrayBase<Transform> allTransforms = Object.FindObjectsOfType<Transform>();
-			if (allTransforms == null) return;
-
-			// Collect category panels: SeasonPassMissionPanel, DailyMissionsPanel, etc.
-			var categoryPanels = new List<(string name, Transform transform)>();
-			for (int i = 0; i < allTransforms.Count; i++)
-			{
-				Transform t = allTransforms[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string goName = ((Object)t.gameObject).name;
-
-				if (goName.Contains("MissionPanel", StringComparison.OrdinalIgnoreCase) ||
-				    goName.Contains("MissionsPanel", StringComparison.OrdinalIgnoreCase))
-				{
-					// Derive a readable category name from the panel name
-					string catName = DeriveCategoryName(goName);
-					categoryPanels.Add((catName, t));
-					DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-						"Mission category panel found: " + goName + " → " + catName);
-				}
-			}
-
-			// For each category panel, find mission tiles underneath
-			foreach (var (catName, panelTransform) in categoryPanels)
-			{
-				var category = new MissionCategory { Name = catName };
-
-				Il2CppArrayBase<Transform> children = panelTransform.gameObject.GetComponentsInChildren<Transform>(true);
-				if (children == null) continue;
-
-				for (int i = 0; i < children.Count; i++)
-				{
-					Transform t = children[i];
-					if ((Object)(object)t == (Object)null) continue;
-					if (!t.gameObject.activeInHierarchy) continue;
-					string goName = ((Object)t.gameObject).name;
-					if (!goName.Contains("tile_pc_main_missions", StringComparison.Ordinal)) continue;
-
-					var mission = ReadMissionTile(t.gameObject);
-					if (mission != null)
-						category.Missions.Add(mission);
-				}
-
-				if (category.Missions.Count > 0)
-					_missionCategories.Add(category);
-			}
-
-			// Fallback: if no category panels found, scan all mission tiles as one "Missions" category
-			if (_missionCategories.Count == 0)
-			{
-				var fallback = new MissionCategory { Name = Loc.Get("missions_category_all") };
-				for (int i = 0; i < allTransforms.Count; i++)
-				{
-					Transform t = allTransforms[i];
-					if ((Object)(object)t == (Object)null) continue;
-					if (!t.gameObject.activeInHierarchy) continue;
-					string goName = ((Object)t.gameObject).name;
-					if (!goName.Contains("tile_pc_main_missions", StringComparison.Ordinal)) continue;
-
-					var mission = ReadMissionTile(t.gameObject);
-					if (mission != null)
-						fallback.Missions.Add(mission);
-				}
-				if (fallback.Missions.Count > 0)
-					_missionCategories.Add(fallback);
-			}
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"ScanMissions: {_missionCategories.Count} categories found");
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ScanMissions failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Reads a single mission tile's data.</summary>
-	private MissionInfo ReadMissionTile(GameObject tile)
-	{
-		if ((Object)(object)tile == (Object)null) return null;
-		string title = "";
-		string progress = "";
-		string goal = "";
-		string description = "";
-		string reward = "";
-
-		try
-		{
-			Il2CppArrayBase<TMP_Text> texts = tile.GetComponentsInChildren<TMP_Text>(true);
-			if (texts == null) return null;
-
-			var rewardParts = new List<string>();
-			for (int j = 0; j < texts.Count; j++)
-			{
-				TMP_Text tmp = texts[j];
-				if ((Object)(object)tmp == (Object)null) continue;
-				string n = ((Object)((Component)tmp).gameObject).name;
-				string v = UIHelper.StripRichText((tmp.text ?? "").Trim());
-				if (string.IsNullOrEmpty(v)) continue;
-
-				if (n.Contains("title", StringComparison.OrdinalIgnoreCase))
-					title = v;
-				else if (n.Contains("missionprogress", StringComparison.OrdinalIgnoreCase))
-					progress = v;
-				else if (n.Contains("missiongoal", StringComparison.OrdinalIgnoreCase))
-					goal = v;
-				else if (n.Contains("description", StringComparison.OrdinalIgnoreCase))
-					description = v;
-				else if (n == "text_credits")
-					rewardParts.Add(v + " credits");
-				else if (n == "text_battlepass")
-					rewardParts.Add(v + " season XP");
-				else if (n.Contains("reward", StringComparison.OrdinalIgnoreCase))
-					rewardParts.Add(v);
-			}
-			if (rewardParts.Count > 0)
-				reward = string.Join(", ", rewardParts);
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ReadMissionTile failed: " + ex.Message);
-		}
-
-		if (string.IsNullOrEmpty(title)) return null;
-
-		// Get the Button component on the tile for clicking
-		Button tileBtn = tile.GetComponent<Button>();
-
-		return new MissionInfo
-		{
-			Title = title,
-			Progress = progress,
-			Goal = goal,
-			Description = description,
-			Reward = reward,
-			TileButton = tileBtn
-		};
-	}
-
-	/// <summary>Derives a readable category name from a panel GameObject name.</summary>
-	private string DeriveCategoryName(string panelName)
-	{
-		if (panelName.Contains("SeasonPass", StringComparison.OrdinalIgnoreCase))
-			return Loc.Get("missions_category_season");
-		if (panelName.Contains("Daily", StringComparison.OrdinalIgnoreCase))
-			return Loc.Get("missions_category_daily");
-		if (panelName.Contains("Weekly", StringComparison.OrdinalIgnoreCase))
-			return Loc.Get("missions_category_weekly");
-		// Generic fallback: clean up the name
-		string clean = panelName.Replace("Panel", "").Replace("Missions", "").Replace("Mission", "").Trim();
-		return string.IsNullOrEmpty(clean) ? Loc.Get("missions_category_all") : UIHelper.CleanGameObjectName(clean);
-	}
-
-	/// <summary>Processes input while browsing the missions menu.</summary>
-	private void ProcessMissionsInput()
-	{
-		if (_missionMenuLevel == 0)
-		{
-			// Category level: Up/Down to browse categories, Enter to drill in, Backspace to exit
-			if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
-			{
-				if (_missionCategoryIndex > 0)
-				{
-					_missionCategoryIndex--;
-					AnnounceMissionCategory();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
-			{
-				if (_missionCategoryIndex < _missionCategories.Count - 1)
-				{
-					_missionCategoryIndex++;
-					AnnounceMissionCategory();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
-			{
-				if (_missionCategoryIndex >= 0 && _missionCategoryIndex < _missionCategories.Count)
-				{
-					var cat = _missionCategories[_missionCategoryIndex];
-					if (cat.Missions.Count > 0)
-					{
-						_missionMenuLevel = 1;
-						_missionIndex = 0;
-						_missionDetailLevel = 0;
-						ScreenReader.Say(Loc.Get("missions_category_entered", cat.Name, cat.Missions.Count));
-						AnnounceMission();
-					}
-					else
-					{
-						ScreenReader.Say(Loc.Get("play_no_missions"));
-					}
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape)
-			         || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
-			{
-				_browsingMissions = false;
-				ScreenReader.Say(Loc.Get("missions_exited"));
-			}
-		}
-		else if (_missionMenuLevel == 1)
-		{
-			// Individual mission level: Left/Right to browse, Down for details, Backspace to go back
-			if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-			{
-				var cat = _missionCategories[_missionCategoryIndex];
-				if (_missionIndex > 0)
-				{
-					_missionIndex--;
-					_missionDetailLevel = 0;
-					AnnounceMission();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-			{
-				var cat = _missionCategories[_missionCategoryIndex];
-				if (_missionIndex < cat.Missions.Count - 1)
-				{
-					_missionIndex++;
-					_missionDetailLevel = 0;
-					AnnounceMission();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
-			{
-				if (_missionDetailLevel < 3)
-				{
-					_missionDetailLevel++;
-					AnnounceMissionDetail();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
-			{
-				if (_missionDetailLevel > 0)
-				{
-					_missionDetailLevel--;
-					if (_missionDetailLevel == 0)
-						AnnounceMission();
-					else
-						AnnounceMissionDetail();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
-			{
-				// Click the mission tile to claim completed missions or view details
-				var cat2 = _missionCategories[_missionCategoryIndex];
-				if (_missionIndex >= 0 && _missionIndex < cat2.Missions.Count)
-				{
-					var mission = cat2.Missions[_missionIndex];
-					if ((Object)(object)mission.TileButton != (Object)null)
-					{
-						bool isComplete = !string.IsNullOrEmpty(mission.Progress) &&
-						                  !string.IsNullOrEmpty(mission.Goal) &&
-						                  mission.Progress == mission.Goal;
-						UIHelper.ClickButton(mission.TileButton);
-						if (isComplete)
-							ScreenReader.Say(Loc.Get("missions_claiming", mission.Title));
-						else
-							ScreenReader.Say(Loc.Get("missions_opening", mission.Title));
-						DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-							"Clicked mission tile: " + mission.Title + " (complete=" + isComplete + ")");
-					}
-					else
-					{
-						ScreenReader.Say(Loc.Get("missions_no_action"));
-					}
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape)
-			         || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
-			{
-				_missionMenuLevel = 0;
-				_missionDetailLevel = 0;
-				ScreenReader.Say(Loc.Get("missions_back_to_categories"));
-				AnnounceMissionCategory();
-			}
-		}
-	}
-
-	private void AnnounceMissionCategory()
-	{
-		if (_missionCategoryIndex < 0 || _missionCategoryIndex >= _missionCategories.Count) return;
-		var cat = _missionCategories[_missionCategoryIndex];
-		ScreenReader.Say(Loc.Get("missions_category", cat.Name, cat.Missions.Count,
-			_missionCategoryIndex + 1, _missionCategories.Count));
-	}
-
-	private void AnnounceMission()
-	{
-		if (_missionCategoryIndex < 0 || _missionCategoryIndex >= _missionCategories.Count) return;
-		var cat = _missionCategories[_missionCategoryIndex];
-		if (_missionIndex < 0 || _missionIndex >= cat.Missions.Count) return;
-		var mission = cat.Missions[_missionIndex];
-
-		string progressInfo = "";
-		if (!string.IsNullOrEmpty(mission.Progress) && !string.IsNullOrEmpty(mission.Goal))
-		{
-			progressInfo = ", " + mission.Progress + " of " + mission.Goal;
-			if (mission.Progress == mission.Goal) progressInfo += ", complete";
-		}
-
-		ScreenReader.Say(Loc.Get("missions_mission", mission.Title, _missionIndex + 1, cat.Missions.Count) + progressInfo);
-	}
-
-	private void AnnounceMissionDetail()
-	{
-		if (_missionCategoryIndex < 0 || _missionCategoryIndex >= _missionCategories.Count) return;
-		var cat = _missionCategories[_missionCategoryIndex];
-		if (_missionIndex < 0 || _missionIndex >= cat.Missions.Count) return;
-		var mission = cat.Missions[_missionIndex];
-
-		switch (_missionDetailLevel)
-		{
-			case 1:
-				// Description / goal text
-				if (!string.IsNullOrEmpty(mission.Description))
-					ScreenReader.Say(Loc.Get("missions_description", mission.Description));
-				else if (!string.IsNullOrEmpty(mission.Title))
-					ScreenReader.Say(mission.Title);
-				else
-					ScreenReader.Say(Loc.Get("missions_no_description"));
-				break;
-			case 2:
-				// Progress
-				if (!string.IsNullOrEmpty(mission.Progress) && !string.IsNullOrEmpty(mission.Goal))
-				{
-					string status = mission.Progress == mission.Goal ? Loc.Get("missions_complete") : "";
-					ScreenReader.Say(Loc.Get("missions_progress", mission.Progress, mission.Goal) +
-					                 (string.IsNullOrEmpty(status) ? "" : ", " + status));
-				}
-				else
-					ScreenReader.Say(Loc.Get("missions_progress_unknown"));
-				break;
-			case 3:
-				// Reward
-				if (!string.IsNullOrEmpty(mission.Reward))
-					ScreenReader.Say(Loc.Get("missions_reward", mission.Reward));
-				else
-					ScreenReader.Say(Loc.Get("missions_no_reward"));
-				break;
-		}
-	}
-
-	// --- Rewards Menu ---
-
-	/// <summary>Reads a reward label from the parent hierarchy of a ClaimButton (e.g. "Next Reward: 100 Credits").</summary>
-	private static string BuildRewardSlotLabel(Transform claimBtnTransform)
-	{
-		try
-		{
-			// Walk up to find the reward slot container (e.g. FinalRewardDay, NextRewardDay)
-			Transform slot = claimBtnTransform.parent; // LoginDailyRewardSlot_Carousel
-			if (slot != null) slot = slot.parent; // FinalRewardDay or NextRewardDay
-			if (slot == null) return null;
-
-			string slotName = ((Object)slot.gameObject).name;
-			string prefix = slotName.Contains("Final", StringComparison.OrdinalIgnoreCase) ? "Final Reward" : "Next Reward";
-
-			// Look for reward text in the sibling RewardLayoutGroup area
-			// The text children are under Contents/RewardText or similar
-			Il2CppArrayBase<TMP_Text> texts = slot.gameObject.GetComponentsInChildren<TMP_Text>(true);
-			if (texts != null)
-			{
-				for (int i = 0; i < texts.Count; i++)
-				{
-					TMP_Text tmp = texts[i];
-					if ((Object)(object)tmp == (Object)null) continue;
-					string goName = ((Object)((Component)tmp).gameObject).name;
-					string val = UIHelper.StripRichText((tmp.text ?? "").Trim());
-					if (string.IsNullOrEmpty(val)) continue;
-
-					// text_Reward Blue, text_Reward Gold contain the reward description
-					if (goName.Contains("text_Reward", StringComparison.OrdinalIgnoreCase) &&
-					    !goName.Contains("FinalReward", StringComparison.OrdinalIgnoreCase) &&
-					    !goName.Contains("NextReward", StringComparison.OrdinalIgnoreCase))
-					{
-						return prefix + ": " + val;
-					}
-				}
-			}
-			return prefix;
-		}
-		catch
-		{
-			return null;
-		}
-	}
-
-	/// <summary>Clicks the game's Escape/Back button (btn_hex_prp) to close the current sub-screen.</summary>
-	private void TryClickGameBackButton()
-	{
-		try
-		{
-			Il2CppArrayBase<Button> allButtons = Object.FindObjectsOfType<Button>();
-			if (allButtons == null) return;
-			for (int i = 0; i < allButtons.Count; i++)
-			{
-				Button btn = allButtons[i];
-				if ((Object)(object)btn == (Object)null) continue;
-				if (!((Component)btn).gameObject.activeInHierarchy) continue;
-				string goName = ((Object)((Component)btn).gameObject).name;
-				if (goName == "btn_hex_prp")
-				{
-					UIHelper.ClickButton(btn);
-					DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Clicked game back button");
-					return;
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "TryClickGameBackButton failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Opens the full rewards screen by clicking "See All Rewards".</summary>
-	private void OpenRewardsMenu()
-	{
-		try
-		{
-			Il2CppArrayBase<Button> allButtons = Object.FindObjectsOfType<Button>();
-			if (allButtons != null)
-			{
-				for (int i = 0; i < allButtons.Count; i++)
-				{
-					Button btn = allButtons[i];
-					if ((Object)(object)btn == (Object)null) continue;
-					if (!((Component)btn).gameObject.activeInHierarchy) continue;
-					string goName = ((Object)((Component)btn).gameObject).name;
-					if (goName == "btn_SeeAllRewards")
-					{
-						ScreenReader.Say(Loc.Get("rewards_opening"));
-						UIHelper.ClickButton(btn);
-						_onPlayScreen = false;
-						_inSubScreen = true;
-						_dialogHandler.ResetWithDelay(2.0f);
-						DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Opened See All Rewards");
-						return;
-					}
-				}
-			}
-			ScreenReader.Say(Loc.Get("rewards_none"));
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "OpenRewardsMenu failed: " + ex.Message);
-			ScreenReader.Say(Loc.Get("rewards_none"));
-		}
-	}
-
-	/// <summary>Scans reward tracks from the Play screen carousel and season pass.</summary>
-	private void ScanRewards()
-	{
-		_rewardCategories.Clear();
-		try
-		{
-			Il2CppArrayBase<Transform> allTransforms = Object.FindObjectsOfType<Transform>();
-			if (allTransforms == null) return;
-
-			// Find carousel cells with login bonus rewards
-			for (int i = 0; i < allTransforms.Count; i++)
-			{
-				Transform t = allTransforms[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string goName = ((Object)t.gameObject).name;
-				if (!goName.Contains("Promo_LoginBonus_Container", StringComparison.Ordinal) &&
-				    !goName.Contains("Promo_LoginRewards", StringComparison.Ordinal))
-					continue;
-
-				// Find the header text for this reward track
-				string header = "";
-				var rewards = new List<RewardItem>();
-
-				Il2CppArrayBase<TMP_Text> texts = t.gameObject.GetComponentsInChildren<TMP_Text>(true);
-				if (texts != null)
-				{
-					for (int j = 0; j < texts.Count; j++)
-					{
-						TMP_Text tmp = texts[j];
-						if ((Object)(object)tmp == (Object)null) continue;
-						string n = ((Object)((Component)tmp).gameObject).name;
-						string v = UIHelper.StripRichText((tmp.text ?? "").Trim());
-						if (string.IsNullOrEmpty(v)) continue;
-						if (n.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
-						    n.Contains("text_Header", StringComparison.OrdinalIgnoreCase))
-							header = v;
-					}
-				}
-
-				// Find claim buttons only (skip btn_SeeAllRewards and other non-claim buttons)
-				Il2CppArrayBase<Button> buttons = t.gameObject.GetComponentsInChildren<Button>(false);
-				if (buttons != null)
-				{
-					for (int j = 0; j < buttons.Count; j++)
-					{
-						Button btn = buttons[j];
-						if ((Object)(object)btn == (Object)null) continue;
-						if (!((Component)btn).gameObject.activeInHierarchy) continue;
-						string btnName = ((Object)((Component)btn).gameObject).name;
-
-						// Only include ClaimButton entries
-						if (btnName != "ClaimButton") continue;
-
-						// Build a label from the reward slot parent text
-						string label = BuildRewardSlotLabel(((Component)btn).transform);
-						if (string.IsNullOrEmpty(label))
-						{
-							label = UIHelper.GetButtonLabel(btn);
-							if (string.IsNullOrEmpty(label) || label.Length < 2) continue;
-						}
-
-						rewards.Add(new RewardItem
-						{
-							Label = label,
-							ClaimButton = btn,
-							Claimable = true
-						});
-					}
-				}
-
-				if (rewards.Count > 0)
-				{
-					if (string.IsNullOrEmpty(header)) header = Loc.Get("rewards_category_login");
-					// Avoid duplicate categories with same header
-					bool exists = false;
-					foreach (var c in _rewardCategories)
-						if (c.Name == header) { exists = true; break; }
-					if (!exists)
-						_rewardCategories.Add(new RewardCategory { Name = header, Rewards = { } });
-					// Add rewards to matching category
-					foreach (var c in _rewardCategories)
-					{
-						if (c.Name == header) { c.Rewards.AddRange(rewards); break; }
-					}
-				}
-			}
-
-			// Also scan season pass button
-			for (int i = 0; i < allTransforms.Count; i++)
-			{
-				Transform t = allTransforms[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string goName = ((Object)t.gameObject).name;
-				if (goName != "SeasonPass_btn") continue;
-
-				Button spBtn = t.gameObject.GetComponent<Button>();
-				if ((Object)(object)spBtn == (Object)null) continue;
-
-				string label = UIHelper.GetButtonLabel(spBtn);
-				if (string.IsNullOrEmpty(label)) label = "Season Pass";
-				_rewardCategories.Add(new RewardCategory
-				{
-					Name = Loc.Get("rewards_category_season"),
-					Rewards = { new RewardItem { Label = label, ClaimButton = spBtn, Claimable = false } }
-				});
-				break;
-			}
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"ScanRewards: {_rewardCategories.Count} categories found");
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ScanRewards failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Processes input while browsing the rewards menu.</summary>
-	private void ProcessRewardsInput()
-	{
-		if (_rewardMenuLevel == 0)
-		{
-			// Category level
-			if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
-			{
-				if (_rewardCategoryIndex > 0)
-				{
-					_rewardCategoryIndex--;
-					AnnounceRewardCategory();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
-			{
-				if (_rewardCategoryIndex < _rewardCategories.Count - 1)
-				{
-					_rewardCategoryIndex++;
-					AnnounceRewardCategory();
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
-			{
-				if (_rewardCategoryIndex >= 0 && _rewardCategoryIndex < _rewardCategories.Count)
-				{
-					var cat = _rewardCategories[_rewardCategoryIndex];
-					if (cat.Rewards.Count > 0)
-					{
-						_rewardMenuLevel = 1;
-						_rewardIndex = 0;
-						ScreenReader.Say(Loc.Get("rewards_category_entered", cat.Name, cat.Rewards.Count));
-						AnnounceReward();
-					}
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape)
-			         || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
-			{
-				_browsingRewards = false;
-				ScreenReader.Say(Loc.Get("rewards_exited"));
-			}
-		}
-		else if (_rewardMenuLevel == 1)
-		{
-			// Individual rewards
-			if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-			{
-				var cat = _rewardCategories[_rewardCategoryIndex];
-				if (_rewardIndex > 0) { _rewardIndex--; AnnounceReward(); }
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-			{
-				var cat = _rewardCategories[_rewardCategoryIndex];
-				if (_rewardIndex < cat.Rewards.Count - 1) { _rewardIndex++; AnnounceReward(); }
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
-			{
-				// Claim reward — use SendPointerClick since carousel buttons may be off-screen
-				var cat = _rewardCategories[_rewardCategoryIndex];
-				if (_rewardIndex >= 0 && _rewardIndex < cat.Rewards.Count)
-				{
-					var reward = cat.Rewards[_rewardIndex];
-					if ((Object)(object)reward.ClaimButton != (Object)null)
-					{
-						ScreenReader.Say(Loc.Get("dialog_activating", reward.Label));
-						// Try pointer click event (works off-screen), then onClick, then mouse sim
-						GameObject go = ((Component)reward.ClaimButton).gameObject;
-						if (!UIHelper.SendPointerClick(go))
-						{
-							if (!UIHelper.ClickButton(reward.ClaimButton))
-								UIHelper.SimulateMouseClick(go);
-						}
-					}
-				}
-			}
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape)
-			         || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
-			{
-				_rewardMenuLevel = 0;
-				ScreenReader.Say(Loc.Get("rewards_back_to_categories"));
-				AnnounceRewardCategory();
-			}
-		}
-	}
-
-	private void AnnounceRewardCategory()
-	{
-		if (_rewardCategoryIndex < 0 || _rewardCategoryIndex >= _rewardCategories.Count) return;
-		var cat = _rewardCategories[_rewardCategoryIndex];
-		ScreenReader.Say(Loc.Get("rewards_category", cat.Name, cat.Rewards.Count,
-			_rewardCategoryIndex + 1, _rewardCategories.Count));
-	}
-
-	private void AnnounceReward()
-	{
-		if (_rewardCategoryIndex < 0 || _rewardCategoryIndex >= _rewardCategories.Count) return;
-		var cat = _rewardCategories[_rewardCategoryIndex];
-		if (_rewardIndex < 0 || _rewardIndex >= cat.Rewards.Count) return;
-		var reward = cat.Rewards[_rewardIndex];
-		string claimHint = reward.Claimable ? ", " + Loc.Get("rewards_claimable") : "";
-		ScreenReader.Say(Loc.Get("rewards_item", reward.Label, _rewardIndex + 1, cat.Rewards.Count) + claimHint);
-	}
-
-	// --- Collection Browsing ---
-
-	/// <summary>Enters the collection browsing mode.</summary>
-	private void EnterCollection()
-	{
-		_browsingCollection = false;
-		_inSubScreen = false;
-		_onPlayScreen = false;
-		_collectionDetailLevel = 0;
-		_returnToCollection = false;
-		ScanCollectionSections();
-		ScanCollectionCards();
-		if (_collectionCards.Count == 0)
-		{
-			// First attempt failed — try a delayed retry
-			if (!_pendingCollectionScan)
-			{
-				ScreenReader.Say(Loc.Get("collection_loading"));
-				_pendingCollectionScan = true;
-				_collectionScanTime = Time.time + 2.0f;
-			}
-			else
-			{
-				// Second attempt also failed — fall back to DialogHandler
-				ScreenReader.Say(Loc.Get("collection_no_cards"));
-				_inSubScreen = true;
-				_dialogHandler.ResetWithDelay(0.6f);
-			}
-			return;
-		}
-		_browsingCollection = true;
-		_collectionIndex = 0;
-		string sectionInfo = _collectionSections.Count > 1
-			? " " + Loc.Get("collection_section_hint", _collectionSections[_collectionSectionIndex])
-			: "";
-		ScreenReader.Say(Loc.Get("collection_entered", _collectionCards.Count) + sectionInfo);
-		AnnounceCollectionCard();
-	}
-
-	/// <summary>Finds the section containers (e.g. CardSectionContainer, DeckSectionContainer) under CollectionContentLayoutGroup.</summary>
-	private void ScanCollectionSections()
-	{
-		_collectionSections.Clear();
-		_collectionSectionIndex = 0;
-		try
-		{
-			Il2CppArrayBase<Transform> allTransforms = Object.FindObjectsOfType<Transform>();
-			if (allTransforms == null) return;
-
-			for (int i = 0; i < allTransforms.Count; i++)
-			{
-				Transform t = allTransforms[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string goName = ((Object)t.gameObject).name;
-				if (goName == "CollectionContentLayoutGroup")
-				{
-					// Enumerate direct children that are section containers
-					for (int c = 0; c < t.childCount; c++)
-					{
-						Transform child = t.GetChild(c);
-						if ((Object)(object)child == (Object)null) continue;
-						if (!child.gameObject.activeInHierarchy) continue;
-						string childName = ((Object)child.gameObject).name;
-						if (childName.Contains("SectionContainer", StringComparison.Ordinal))
-						{
-							// Clean up the name for display: "CardSectionContainer" → "Cards", "DeckEditSectionContainer" → "Deck"
-							string displayName = childName
-								.Replace("SectionContainer", "")
-								.Replace("Section", "");
-							if (displayName.EndsWith("Card")) displayName = "Cards";
-							else if (displayName.Contains("Deck")) displayName = "Deck";
-							else if (string.IsNullOrEmpty(displayName)) displayName = childName;
-							_collectionSections.Add(displayName);
-						}
-					}
-					break;
-				}
-			}
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"ScanCollectionSections: {_collectionSections.Count} sections found: {string.Join(", ", _collectionSections)}");
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ScanCollectionSections failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Scans collection cards filtered to a specific section by index.</summary>
-	private void ScanCollectionCardsInSection(int sectionIndex)
-	{
-		_collectionCards.Clear();
-		try
-		{
-			// Find the section container name for filtering
-			string sectionContainerName = null;
-			Il2CppArrayBase<Transform> allTransforms = Object.FindObjectsOfType<Transform>();
-			if (allTransforms == null) return;
-
-			for (int i = 0; i < allTransforms.Count; i++)
-			{
-				Transform t = allTransforms[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string goName = ((Object)t.gameObject).name;
-				if (goName == "CollectionContentLayoutGroup")
-				{
-					int sIdx = 0;
-					for (int c = 0; c < t.childCount; c++)
-					{
-						Transform child = t.GetChild(c);
-						if ((Object)(object)child == (Object)null) continue;
-						if (!child.gameObject.activeInHierarchy) continue;
-						string childName = ((Object)child.gameObject).name;
-						if (childName.Contains("SectionContainer", StringComparison.Ordinal))
-						{
-							if (sIdx == sectionIndex)
-							{
-								sectionContainerName = childName;
-								break;
-							}
-							sIdx++;
-						}
-					}
-					break;
-				}
-			}
-
-			if (sectionContainerName == null)
-			{
-				DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-					$"ScanCollectionCardsInSection: section {sectionIndex} not found");
-				return;
-			}
-
-			// Scan CardRenderers under this specific section
-			Il2CppArrayBase<CardRenderer> allRenderers = Object.FindObjectsOfType<CardRenderer>();
-			if (allRenderers == null || allRenderers.Count == 0) return;
-
-			for (int i = 0; i < allRenderers.Count; i++)
-			{
-				CardRenderer renderer = allRenderers[i];
-				if ((Object)(object)renderer == (Object)null) continue;
-				if (!((Component)renderer).gameObject.activeInHierarchy) continue;
-
-				bool isInSection = false;
-				Button parentButton = null;
-				Transform t = ((Component)renderer).transform;
-				int depth = 0;
-				while (t != null && depth < 20)
-				{
-					string pName = ((Object)t.gameObject).name;
-					if (pName == sectionContainerName)
-					{
-						isInSection = true;
-						break;
-					}
-					if (pName.Contains("CardDetails", StringComparison.Ordinal))
-						break;
-					if (parentButton == null)
-					{
-						Button btn = t.gameObject.GetComponent<Button>();
-						if ((Object)(object)btn != (Object)null)
-							parentButton = btn;
-					}
-					t = t.parent;
-					depth++;
-				}
-
-				if (!isInSection) continue;
-
-				string cardName = "";
-				try { cardName = renderer.CardName; } catch { }
-				if (string.IsNullOrEmpty(cardName) || cardName.Length < 2) continue;
-
-				bool exists = false;
-				foreach (var c in _collectionCards)
-					if (c.Name == cardName) { exists = true; break; }
-				if (exists) continue;
-
-				_collectionCards.Add(new CollectionCard
-				{
-					Name = cardName,
-					Button = parentButton,
-					Renderer = renderer
-				});
-			}
-
-			_collectionCards.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"ScanCollectionCardsInSection({sectionIndex}): {_collectionCards.Count} cards in '{sectionContainerName}'");
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				"ScanCollectionCardsInSection failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Scans visible collection cards from the CollectionViewLandscape hierarchy.</summary>
-	private void ScanCollectionCards()
-	{
-		_collectionCards.Clear();
-		try
-		{
-			// Strategy: find all CardRenderers in the scene that are under CollectionViewLandscape,
-			// then match each to its parent button (LandscapeCollectionCardView)
-			Il2CppArrayBase<CardRenderer> allRenderers = Object.FindObjectsOfType<CardRenderer>();
-			if (allRenderers == null || allRenderers.Count == 0)
-			{
-				DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "No CardRenderers found in scene");
-				// Fallback: try finding collection by button scan
-				ScanCollectionCardsByButton();
-				return;
-			}
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"Found {allRenderers.Count} CardRenderers in scene");
-
-			for (int i = 0; i < allRenderers.Count; i++)
-			{
-				CardRenderer renderer = allRenderers[i];
-				if ((Object)(object)renderer == (Object)null) continue;
-				if (!((Component)renderer).gameObject.activeInHierarchy) continue;
-
-				// Check if this CardRenderer is under CollectionViewLandscape
-				bool isInCollection = false;
-				Button parentButton = null;
-				Transform t = ((Component)renderer).transform;
-				int depth = 0;
-				while (t != null && depth < 20)
-				{
-					string pName = ((Object)t.gameObject).name;
-					if (pName.Contains("CollectionViewLandscape", StringComparison.Ordinal))
-					{
-						isInCollection = true;
-						break;
-					}
-					// Also check if this is a CardDetails view (skip those)
-					if (pName.Contains("CardDetails", StringComparison.Ordinal))
-						break;
-					// Check for parent button
-					if (parentButton == null)
-					{
-						Button btn = t.gameObject.GetComponent<Button>();
-						if ((Object)(object)btn != (Object)null)
-							parentButton = btn;
-					}
-					t = t.parent;
-					depth++;
-				}
-
-				if (!isInCollection) continue;
-
-				string cardName = "";
-				try { cardName = renderer.CardName; } catch { }
-
-				if (string.IsNullOrEmpty(cardName) || cardName.Length < 2)
-				{
-					// Debug: log what we found
-					DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-						$"CardRenderer under collection has empty CardName, GO: {((Object)((Component)renderer).gameObject).name}");
-					continue;
-				}
-
-				// Skip duplicates (same card name)
-				bool exists = false;
-				foreach (var c in _collectionCards)
-					if (c.Name == cardName) { exists = true; break; }
-				if (exists) continue;
-
-				_collectionCards.Add(new CollectionCard
-				{
-					Name = cardName,
-					Button = parentButton,
-					Renderer = renderer
-				});
-			}
-
-			// Sort alphabetically for consistent browsing
-			_collectionCards.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"ScanCollectionCards (CardRenderer approach): {_collectionCards.Count} cards found");
-
-			// If CardRenderer approach found nothing, try button scan fallback
-			if (_collectionCards.Count == 0)
-				ScanCollectionCardsByButton();
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ScanCollectionCards failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Fallback: scan collection by finding buttons under CollectionRowListScroller and reading card names.</summary>
-	private void ScanCollectionCardsByButton()
-	{
-		try
-		{
-			// Find the collection scroller
-			Il2CppArrayBase<Transform> allTransforms = Object.FindObjectsOfType<Transform>();
-			if (allTransforms == null) return;
-
-			GameObject collectionRoot = null;
-			for (int i = 0; i < allTransforms.Count; i++)
-			{
-				Transform t = allTransforms[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string goName = ((Object)t.gameObject).name;
-				if (goName.Contains("CollectionRowListScroller", StringComparison.Ordinal) ||
-				    goName.Contains("CollectionViewLandscape", StringComparison.Ordinal))
-				{
-					collectionRoot = t.gameObject;
-					DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-						"Collection root found: " + goName);
-					break;
-				}
-			}
-
-			if ((Object)(object)collectionRoot == (Object)null)
-			{
-				DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "Collection root not found");
-				return;
-			}
-
-			// Find all buttons and try to get card names via CardRenderer child components
-			Il2CppArrayBase<Button> buttons = collectionRoot.GetComponentsInChildren<Button>(false);
-			if (buttons == null) return;
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"Collection buttons found: {buttons.Count}");
-
-			// Debug: log components on the first collection card button
-			bool loggedFirst = false;
-
-			for (int i = 0; i < buttons.Count; i++)
-			{
-				Button btn = buttons[i];
-				if ((Object)(object)btn == (Object)null) continue;
-				if (!((Component)btn).gameObject.activeInHierarchy) continue;
-
-				string goName = ((Object)((Component)btn).gameObject).name;
-				if (!goName.Contains("CollectionCardView", StringComparison.OrdinalIgnoreCase))
-					continue;
-
-				// Debug: dump all components on first card
-				if (!loggedFirst)
-				{
-					loggedFirst = true;
-					try
-					{
-						Il2CppArrayBase<Component> components = ((Component)btn).GetComponentsInChildren<Component>(true);
-						if (components != null)
-						{
-							for (int j = 0; j < components.Count && j < 30; j++)
-							{
-								Component comp = components[j];
-								if ((Object)(object)comp == (Object)null) continue;
-								string compType = ((object)comp).GetType().Name;
-								string compGo = ((Object)((Component)comp).gameObject).name;
-								DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-									$"  CollCard component [{j}]: {compType} on {compGo}");
-							}
-						}
-					}
-					catch { }
-				}
-
-				// Try CardRenderer
-				string cardName = "";
-				CardRenderer renderer = null;
-				try
-				{
-					renderer = ((Component)btn).GetComponentInChildren<CardRenderer>(true);
-					if (renderer != null)
-					{
-						cardName = renderer.CardName;
-						DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-							$"CardRenderer found on {goName}: CardName='{cardName}'");
-					}
-				}
-				catch (Exception ex)
-				{
-					DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-						$"CardRenderer access failed on {goName}: {ex.Message}");
-				}
-
-				if (string.IsNullOrEmpty(cardName) || cardName.Length < 2)
-					continue;
-
-				_collectionCards.Add(new CollectionCard
-				{
-					Name = cardName,
-					Button = btn,
-					Renderer = renderer
-				});
-			}
-
-			_collectionCards.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
-
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				$"ScanCollectionCardsByButton: {_collectionCards.Count} cards found");
-		}
-		catch (Exception ex)
-		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-				"ScanCollectionCardsByButton failed: " + ex.Message);
-		}
-	}
-
-	/// <summary>Processes input while browsing the collection.</summary>
-	private void ProcessCollectionInput()
-	{
-		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-		{
-			if (_collectionCards.Count == 0) return;
-			_collectionIndex = (_collectionIndex - 1 + _collectionCards.Count) % _collectionCards.Count;
-			_collectionDetailLevel = 0;
-			AnnounceCollectionCard();
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-		{
-			if (_collectionCards.Count == 0) return;
-			_collectionIndex = (_collectionIndex + 1) % _collectionCards.Count;
-			_collectionDetailLevel = 0;
-			AnnounceCollectionCard();
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
-		{
-			if (_collectionDetailLevel < 3) _collectionDetailLevel++;
-			AnnounceCollectionDetail();
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
-		{
-			if (_collectionDetailLevel > 0)
-			{
-				_collectionDetailLevel--;
-				if (_collectionDetailLevel == 0)
-					AnnounceCollectionCard();
-				else
-					AnnounceCollectionDetail();
-			}
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
-		{
-			// Open card detail view
-			if (_collectionIndex >= 0 && _collectionIndex < _collectionCards.Count)
-			{
-				var card = _collectionCards[_collectionIndex];
-				if ((Object)(object)card.Button != (Object)null)
-				{
-					ScreenReader.Say(Loc.Get("collection_opening", card.Name));
-					UIHelper.ClickButtonWithFallback(card.Button);
-					// Switch to dialog handler for the detail view
-					_browsingCollection = false;
-					_inSubScreen = true;
-					_returnToCollection = true;
-					_dialogHandler.ResetWithDelay(0.8f);
-				}
-			}
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Tab))
-		{
-			// Cycle collection sections (Cards, Decks, etc.)
-			if (_collectionSections.Count > 1)
-			{
-				bool shift = SDLInput.IsShiftHeld;
-				if (shift)
-					_collectionSectionIndex = (_collectionSectionIndex - 1 + _collectionSections.Count) % _collectionSections.Count;
-				else
-					_collectionSectionIndex = (_collectionSectionIndex + 1) % _collectionSections.Count;
-				string sectionName = _collectionSections[_collectionSectionIndex];
-				// Rescan for this section's cards
-				ScanCollectionCardsInSection(_collectionSectionIndex);
-				if (_collectionCards.Count > 0)
-				{
-					_collectionIndex = 0;
-					_collectionDetailLevel = 0;
-					// For deck section, include deck name in announcement
-					string deckInfo = sectionName.Contains("Deck") ? ReadDeckEditorName() : "";
-					if (!string.IsNullOrEmpty(deckInfo))
-						ScreenReader.Say(Loc.Get("collection_section_items", sectionName + ": " + deckInfo, _collectionCards.Count));
-					else
-						ScreenReader.Say(Loc.Get("collection_section_items", sectionName, _collectionCards.Count));
-					AnnounceCollectionCard();
-				}
-				else
-				{
-					ScreenReader.Say(Loc.Get("collection_section", sectionName, _collectionSectionIndex + 1, _collectionSections.Count));
-					ScreenReader.SayQueued(Loc.Get("collection_no_cards"));
-				}
-			}
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape)
-		         || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
-		{
-			_browsingCollection = false;
-			_collectionDetailLevel = 0;
-			_returnToCollection = false;
-			TryClickGameBackButton();
-			ScreenReader.Say(Loc.Get("collection_exited"));
-			// Return to menu bar
-			ScreenReader.SayQueued(Loc.Get("menu_nav_focus"));
-			AnnounceFocused();
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.R))
-		{
-			// Rescan collection cards (virtual scrolling may have loaded new ones)
-			ScanCollectionCards();
-			if (_collectionCards.Count > 0)
-			{
-				_collectionIndex = 0;
-				_collectionDetailLevel = 0;
-				ScreenReader.Say(Loc.Get("collection_rescanned", _collectionCards.Count));
-				AnnounceCollectionCard();
-			}
-			else
-			{
-				ScreenReader.Say(Loc.Get("collection_no_cards"));
-			}
-		}
-	}
-
-	private void AnnounceCollectionCard()
-	{
-		if (_collectionIndex < 0 || _collectionIndex >= _collectionCards.Count) return;
-		var card = _collectionCards[_collectionIndex];
-		ScreenReader.Say(Loc.Get("collection_card", card.Name, _collectionIndex + 1, _collectionCards.Count));
-	}
-
-	/// <summary>Reads the deck name from the deck editor's InputField_DeckName or Text_DeckName.</summary>
-	private string ReadDeckEditorName()
-	{
-		try
-		{
-			Il2CppArrayBase<TMP_Text> allTexts = Object.FindObjectsOfType<TMP_Text>();
-			if (allTexts == null) return "";
-			for (int i = 0; i < allTexts.Count; i++)
-			{
-				TMP_Text tmp = allTexts[i];
-				if ((Object)(object)tmp == (Object)null) continue;
-				if (!((Component)tmp).gameObject.activeInHierarchy) continue;
-				string goName = ((Object)((Component)tmp).gameObject).name;
-				if (goName == "Text_DeckName")
-				{
-					string val = UIHelper.StripRichText((tmp.text ?? "").Trim());
-					if (!string.IsNullOrEmpty(val) && val.Length >= 2)
-						return val;
-				}
-			}
-		}
-		catch { }
-		return "";
-	}
-
-	private void AnnounceCollectionDetail()
-	{
-		if (_collectionIndex < 0 || _collectionIndex >= _collectionCards.Count) return;
-		var card = _collectionCards[_collectionIndex];
-
-		switch (_collectionDetailLevel)
-		{
-			case 1:
-				// Cost
-				try
-				{
-					if (card.Renderer != null)
-					{
-						CardValueView cv = card.Renderer._CostValueView;
-						if ((Object)(object)cv != (Object)null)
-						{
-							ScreenReader.Say(Loc.Get("deck_card_cost", cv.Value));
-							return;
-						}
-					}
-				}
-				catch { }
-				ScreenReader.Say(Loc.Get("deck_card_cost", "?"));
-				break;
-			case 2:
-				// Power
-				try
-				{
-					if (card.Renderer != null)
-					{
-						CardValueView pv = card.Renderer._PowerValueView;
-						if ((Object)(object)pv != (Object)null)
-						{
-							ScreenReader.Say(Loc.Get("deck_card_power", pv.Value));
-							return;
-						}
-					}
-				}
-				catch { }
-				ScreenReader.Say(Loc.Get("deck_card_power", "?"));
-				break;
-			case 3:
-				// Ability text
-				string ability = GetCollectionCardAbility(card);
-				ScreenReader.Say(!string.IsNullOrEmpty(ability) ? ability : Loc.Get("deck_card_no_ability"));
-				break;
-		}
-	}
-
-	/// <summary>Tries to read ability text from a collection card's CardRenderer.</summary>
-	private string GetCollectionCardAbility(CollectionCard card)
-	{
-		if (card.Renderer == null) return "";
-		try
-		{
-			TMP_Text abilityTmp = card.Renderer._AbilityText;
-			if ((Object)(object)abilityTmp != (Object)null)
-			{
-				string raw = abilityTmp.text;
-				if (!string.IsNullOrWhiteSpace(raw) && !raw.Contains("Missing Entry"))
-				{
-					string cleaned = UIHelper.StripRichText(raw.Trim());
-					if (cleaned.Length > 3) return cleaned;
-				}
-			}
-		}
-		catch { }
-
-		// Fallback: search TMP_Text children for ability text
-		try
-		{
-			Il2CppArrayBase<TMP_Text> texts = ((Component)card.Button).GetComponentsInChildren<TMP_Text>(true);
-			if (texts != null)
-			{
-				for (int i = 0; i < texts.Count; i++)
-				{
-					TMP_Text tmp = texts[i];
-					if ((Object)(object)tmp == (Object)null) continue;
-					string goName = ((Object)((Component)tmp).gameObject).name;
-					if (!goName.Contains("Ability", StringComparison.OrdinalIgnoreCase)) continue;
-					string text = tmp.text;
-					if (string.IsNullOrWhiteSpace(text) || text.Contains("Missing Entry")) continue;
-					string cleaned = UIHelper.StripRichText(text.Trim());
-					if (cleaned.Length > 3 && cleaned != card.Name) return cleaned;
-				}
-			}
-		}
-		catch { }
-		return "";
-	}
-
-	/// <summary>Reads rank and season info from the Play screen.</summary>
-	private void ReadPlayScreenInfo()
-	{
-		string rank = ReadRankText();
-		string season = ReadSeasonText();
-		string msg = "";
-		if (!string.IsNullOrEmpty(rank)) msg += rank;
-		if (!string.IsNullOrEmpty(season)) msg += " " + season;
-		if (string.IsNullOrEmpty(msg))
-			msg = Loc.Get("play_no_info");
-		ScreenReader.Say(msg);
-	}
-
-	private string ReadRankText()
-	{
-		try
-		{
-			Il2CppArrayBase<TMP_Text> allTexts = Object.FindObjectsOfType<TMP_Text>();
-			if (allTexts == null) return "";
-
-			string rankNumber = "";
-			string rankProgress = "";
-
-			for (int i = 0; i < allTexts.Count; i++)
-			{
-				TMP_Text tmp = allTexts[i];
-				if ((Object)(object)tmp == (Object)null) continue;
-				if (!((Component)tmp).gameObject.activeInHierarchy) continue;
-				string goName = ((Object)((Component)tmp).gameObject).name;
-
-				// Text_Rank under container_rank/img_bannerRank has the actual rank number
-				if (goName == "Text_Rank")
-				{
-					string val = (tmp.text ?? "").Trim();
-					if (!string.IsNullOrEmpty(val) && val.Length <= 4)
-						rankNumber = val;
-				}
-				// Text_Progress under rankmeter_bg/info shows "0 / 1"
-				else if (goName == "Text_Progress")
-				{
-					string parentPath = "";
-					try
-					{
-						Transform p = ((Component)tmp).transform.parent;
-						if (p != null) parentPath = ((Object)p.gameObject).name;
-					}
-					catch { }
-					if (parentPath == "info")
-						rankProgress = (tmp.text ?? "").Trim();
-				}
-			}
-
-			if (!string.IsNullOrEmpty(rankNumber))
-			{
-				string msg = Loc.Get("play_rank", rankNumber);
-				if (!string.IsNullOrEmpty(rankProgress))
-					msg += ", " + rankProgress;
-				return msg;
-			}
-		}
-		catch { }
-		return "";
-	}
-
-	private string ReadSeasonText()
-	{
-		try
-		{
-			Il2CppArrayBase<TMP_Text> allTexts = Object.FindObjectsOfType<TMP_Text>();
-			if (allTexts == null) return "";
-
-			for (int i = 0; i < allTexts.Count; i++)
-			{
-				TMP_Text tmp = allTexts[i];
-				if ((Object)(object)tmp == (Object)null) continue;
-				if (!((Component)tmp).gameObject.activeInHierarchy) continue;
-				string goName = ((Object)((Component)tmp).gameObject).name;
-				if (goName == "seasonpass_title")
-				{
-					string season = UIHelper.StripRichText(tmp.text ?? "").Trim();
-					if (!string.IsNullOrEmpty(season))
-						return Loc.Get("play_season", season);
-				}
-			}
-		}
-		catch { }
-		return "";
+		ScreenReader.Say(Loc.Get("play_screen") + " Deck: " + _deckName);
+		AnnouncePlayCategory();
 	}
 
 	private void ProcessPlayInput()
 	{
-		if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
 		{
-			if ((Object)(object)_playButton != (Object)null)
-			{
-				ScreenReader.Say(Loc.Get("play_starting"));
-				UIHelper.ClickButton(_playButton);
-			}
-			else
-			{
-				ScreenReader.Say(Loc.Get("play_no_button"));
-			}
+			_playCategory = (PlayMenuCategory)(((int)_playCategory - 1 + _playMenuCount) % _playMenuCount);
+			AnnouncePlayCategory();
 		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.S))
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
 		{
-			// Open deck selector
-			if ((Object)(object)_deckLeftButton != (Object)null)
-			{
-				ScreenReader.Say(Loc.Get("play_opening_deck_selector"));
-				UIHelper.ClickButton(_deckLeftButton);
-				// Switch to sub-screen mode so DialogHandler handles the deck tray
-				// Use delayed scan — the PlayDeckTray takes a moment to render
-				_onPlayScreen = false;
-				_inSubScreen = true;
-				_returnToPlayScreen = true;
-				_dialogHandler.ResetWithDelay(0.6f);
-			}
-			else
-			{
-				ScreenReader.Say(Loc.Get("play_no_deck_switch"));
-			}
+			_playCategory = (PlayMenuCategory)(((int)_playCategory + 1) % _playMenuCount);
+			AnnouncePlayCategory();
 		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.D))
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
 		{
-			ScanDeckCards();
+			// Read details about current category
+			AnnouncePlayCategoryDetails();
 		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.M))
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
 		{
-			OpenMissionsMenu();
+			ActivatePlayCategory();
 		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.I))
+		// Backspace is handled centrally in ProcessInput -> HandleBackCommand
+	}
+
+	private void AnnouncePlayCategory()
+	{
+		string label = _playCategory switch
 		{
-			ReadPlayScreenInfo();
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.R))
+			PlayMenuCategory.StartGame => _startButtonLabel,
+			PlayMenuCategory.SelectDeck => "Select Deck (Current: " + _deckName + ")",
+			PlayMenuCategory.EditDeck => "Edit Current Deck",
+			PlayMenuCategory.Missions => "Missions",
+			PlayMenuCategory.Rewards => "Rewards",
+			PlayMenuCategory.GameInfo => "Season & Rank Info",
+			_ => "Unknown"
+		};
+		ScreenReader.Say(label + ", " + ((int)_playCategory + 1) + " of " + _playMenuCount);
+	}
+
+	private void AnnouncePlayCategoryDetails()
+	{
+		string detail = _playCategory switch
 		{
-			OpenRewardsMenu();
+			PlayMenuCategory.StartGame => "Press Enter to start a match with deck: " + _deckName,
+			PlayMenuCategory.SelectDeck => "Current deck: " + _deckName + ". Press Enter to switch.",
+			PlayMenuCategory.EditDeck => "Opens the deck editor for " + _deckName,
+			PlayMenuCategory.Missions => "View daily and season missions",
+			PlayMenuCategory.Rewards => "View and claim available rewards",
+			PlayMenuCategory.GameInfo => ReadRankText() + ". " + ReadSeasonText(),
+			_ => ""
+		};
+		ScreenReader.Say(detail);
+	}
+
+	private void ActivatePlayCategory()
+	{
+		// Re-scan play screen buttons in case they weren't loaded on first entry
+		ScanPlayScreen();
+
+		switch (_playCategory)
+		{
+			case PlayMenuCategory.StartGame:
+				if (_playButton != null)
+				{
+					ScreenReader.Say(_startButtonLabel);
+					// btn_start often ignores onClick — use SendPointerClick then mouse fallback
+					if (!UIHelper.SendPointerClick(((Component)_playButton).gameObject))
+						UIHelper.SimulateMouseClick(((Component)_playButton).gameObject);
+				}
+				break;
+			case PlayMenuCategory.SelectDeck:
+				Button deckBtn = _deckLeftButton ?? _deckRightButton;
+				if (deckBtn != null) UIHelper.ClickButtonWithFallback(deckBtn);
+				else ScreenReader.Say("Deck selection not available.");
+				break;
+			case PlayMenuCategory.EditDeck:
+				TryOpenDeckEditor();
+				break;
+			case PlayMenuCategory.Missions:
+				_missionsHandler.Activate();
+				break;
+			case PlayMenuCategory.Rewards:
+				ScanRewards();
+				if (_rewardEvents.Count > 0)
+				{
+					_browsingRewards = true;
+					_rewardIndex = 0;
+					ScreenReader.Say("Rewards, " + _rewardEvents.Count + " events.");
+					AnnounceReward();
+				}
+				else
+				{
+					ScreenReader.Say("No rewards found.");
+				}
+				break;
+			case PlayMenuCategory.GameInfo:
+				ReadPlayScreenInfo();
+				break;
 		}
 	}
 
-	// --- Deck Card Browsing ---
-
-	private void ScanDeckCards()
+	private void ScanPlayScreen()
 	{
-		_deckCards.Clear();
+		// Search under PlayScreenLandscape specifically to avoid picking up buttons from other screens
+		GameObject playScreen = GameObject.Find("PlayScreenLandscape(Clone)");
+		if (playScreen != null)
+		{
+			_playButton = FindButtonUnder(playScreen.transform, "btn_start") ?? FindButtonUnder(playScreen.transform, "PlayButton");
+			_deckLeftButton = FindButtonUnder(playScreen.transform, "btn_left");
+			_deckRightButton = FindButtonUnder(playScreen.transform, "btn_right");
+		}
+		else
+		{
+			_playButton = FindButtonByName("btn_start") ?? FindButtonByName("PlayButton");
+			_deckLeftButton = FindButtonByName("btn_left");
+			_deckRightButton = FindButtonByName("btn_right");
+		}
+		_deckName = ReadDeckNameFromUI();
+
+		// Read the actual start button label (may say "Reconnect to Game" etc.)
+		if (_playButton != null)
+		{
+			string label = UIHelper.GetButtonLabel(_playButton);
+			if (!string.IsNullOrEmpty(label) && label.Length > 2)
+				_startButtonLabel = label;
+			else
+				_startButtonLabel = "Start Game";
+		}
+		else
+		{
+			_startButtonLabel = "Start Game";
+		}
+	}
+
+	private string ReadDeckNameFromUI()
+	{
+		// Primary: find the Text_Name TMP_Text (under Disk_Base/ReactiveDeckView)
 		try
 		{
-			// First try to find cards under a deck-related parent container
-			// This avoids picking up collection/album cards
-			GameObject deckParent = FindDeckContainer();
-			Il2CppArrayBase<CardView> cards;
-
-			if ((Object)(object)deckParent != (Object)null)
+			TMP_Text[] texts = Object.FindObjectsOfType<TMP_Text>();
+			foreach (var t in texts)
 			{
-				cards = deckParent.GetComponentsInChildren<CardView>(false);
-				DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-					"Scanning deck cards under: " + ((Object)deckParent).name);
-			}
-			else
-			{
-				// Fallback: all CardViews, but filter aggressively
-				cards = Object.FindObjectsOfType<CardView>();
-				DebugLogger.Log(LogCategory.Handler, "MainMenuHandler",
-					"No deck container found, scanning all CardViews");
-			}
-
-			if (cards != null)
-			{
-				for (int i = 0; i < cards.Count; i++)
+				if (t.gameObject.name == "Text_Name" && t.gameObject.activeInHierarchy)
 				{
-					CardView cv = cards[i];
-					if ((Object)(object)cv == (Object)null) continue;
-					if (!((Component)cv).gameObject.activeInHierarchy) continue;
-
-					// Skip cards with no real name (unloaded collection cards)
-					string name = GetDeckCardName(cv);
-					if (string.IsNullOrEmpty(name)) continue;
-					if (name.Contains("Card View", StringComparison.OrdinalIgnoreCase)) continue;
-					if (name.Contains("Variant List", StringComparison.OrdinalIgnoreCase)) continue;
-					if (name.Contains("Album Card", StringComparison.OrdinalIgnoreCase)) continue;
-					if (name == "Card" || name == "Unknown card") continue;
-
-					_deckCards.Add(cv);
+					string name = UIHelper.StripRichText(t.text);
+					if (!string.IsNullOrEmpty(name) && name.Length > 1 && !name.Contains("{Missing"))
+						return name;
 				}
+			}
+		}
+		catch { }
+		// Fallback: try btn_left label
+		if (_deckLeftButton != null)
+		{
+			string label = UIHelper.GetButtonLabel(_deckLeftButton);
+			if (!string.IsNullOrEmpty(label) && label.Length > 2 && !char.IsDigit(label[0]) && !label.Contains("Rank")) return label;
+		}
+		return "Current Deck";
+	}
+
+	private void ReadPlayScreenInfo()
+	{
+		string rank = ReadRankText();
+		string season = ReadSeasonText();
+		ScreenReader.Say(rank + ". " + season);
+	}
+
+	private string ReadRankText()
+	{
+        TMP_Text[] texts = Object.FindObjectsOfType<TMP_Text>();
+        foreach (var t in texts) {
+            if (t.gameObject.name == "Text_Rank" && t.gameObject.activeInHierarchy) return "Rank " + t.text;
+        }
+		return "Rank unknown";
+	}
+
+	private string ReadSeasonText()
+	{
+        TMP_Text[] texts = Object.FindObjectsOfType<TMP_Text>();
+        foreach (var t in texts) {
+            if (t.gameObject.name == "seasonpass_title" && t.gameObject.activeInHierarchy) return "Season: " + t.text;
+        }
+		return "";
+	}
+
+	// --- Game Modes ---
+
+	private void EnterGameModes()
+	{
+		_inGameModes = true;
+		_inSubScreen = false;
+		MelonCoroutines.Start(ScanGameModesDelayed());
+	}
+
+	private IEnumerator ScanGameModesDelayed()
+	{
+		// GameModeScreen needs time to load after clicking the button
+		for (int attempt = 0; attempt < 6; attempt++)
+		{
+			yield return new WaitForSeconds(attempt == 0 ? 0.8f : 0.5f);
+			ScanGameModes();
+			if (_gameModeEntries.Count > 0) break;
+		}
+		if (_gameModeEntries.Count > 0)
+		{
+			_gameModeIndex = 0;
+			ScreenReader.Say("Game Modes. " + _gameModeEntries.Count + " modes.");
+			AnnounceGameMode();
+		}
+		else
+		{
+			ScreenReader.Say("No game modes found.");
+		}
+	}
+
+	private void ScanGameModes()
+	{
+		_gameModeEntries.Clear();
+		try
+		{
+			// Game mode screen is at GameModeScreen(Clone)/MainCanvas/SafePanel/ModesScrollView/Root/Content
+			GameObject gameModeScreen = GameObject.Find("GameModeScreen(Clone)");
+			if (gameModeScreen == null) return;
+
+			Transform content = UIHelper.FindChildByName(gameModeScreen.transform, "Content");
+			if ((Object)(object)content == (Object)null) return;
+
+			for (int i = 0; i < content.childCount; i++)
+			{
+				Transform child = content.GetChild(i);
+				if (!child.gameObject.activeInHierarchy) continue;
+				string goName = child.gameObject.name;
+
+				// Read label from Text_Header child under Root or TitleAnchor
+				string label = "";
+				Transform textHeader = UIHelper.FindChildByName(child, "Text_Header");
+				if ((Object)(object)textHeader != (Object)null)
+				{
+					var tmp = textHeader.GetComponent<TMP_Text>();
+					if ((Object)(object)tmp != (Object)null)
+						label = UIHelper.StripRichText(tmp.text);
+				}
+				if (string.IsNullOrEmpty(label))
+					label = UIHelper.CleanGameObjectName(goName.Replace("btn_", ""));
+				if (string.IsNullOrEmpty(label) || label.Length < 2) continue;
+
+				// Check if locked (has LockedGroup child that is active)
+				bool isLocked = false;
+				string lockReason = "";
+				Transform lockedGroup = UIHelper.FindChildByName(child, "LockedGroup");
+				if ((Object)(object)lockedGroup != (Object)null)
+				{
+					// Check both activeInHierarchy and activeSelf — Il2Cpp can be inconsistent
+					bool groupActive = false;
+					try { groupActive = lockedGroup.gameObject.activeInHierarchy || lockedGroup.gameObject.activeSelf; } catch { groupActive = true; }
+					if (groupActive)
+					{
+						isLocked = true;
+						Transform contentText = UIHelper.FindChildByName(lockedGroup, "ContentText");
+						if ((Object)(object)contentText != (Object)null)
+						{
+							var descTmp = contentText.GetComponent<TMP_Text>();
+							if ((Object)(object)descTmp != (Object)null)
+								lockReason = UIHelper.StripRichText(descTmp.text);
+						}
+					}
+				}
+
+				// Also check for tooltip_locked (alternative lock indicator)
+				if (!isLocked)
+				{
+					Transform tooltipLocked = UIHelper.FindChildByName(child, "tooltip_locked");
+					if ((Object)(object)tooltipLocked != (Object)null)
+					{
+						bool tooltipActive = false;
+						try { tooltipActive = tooltipLocked.gameObject.activeInHierarchy || tooltipLocked.gameObject.activeSelf; } catch { tooltipActive = true; }
+						if (tooltipActive)
+						{
+							isLocked = true;
+							Transform descTf = UIHelper.FindChildByName(tooltipLocked, "text_description");
+							if ((Object)(object)descTf != (Object)null)
+							{
+								var descTmp = descTf.GetComponent<TMP_Text>();
+								if ((Object)(object)descTmp != (Object)null)
+									lockReason = UIHelper.StripRichText(descTmp.text);
+							}
+						}
+					}
+				}
+
+				// Fallback: scan all text children for lock-related keywords
+				if (!isLocked)
+				{
+					TMP_Text[] allTexts = child.GetComponentsInChildren<TMP_Text>(true);
+					foreach (var t in allTexts)
+					{
+						if (t == null) continue;
+						string val = UIHelper.StripRichText(t.text);
+						if (!string.IsNullOrEmpty(val) &&
+							(val.Contains("Unlock") || val.Contains("unlock") || val.Contains("Locked") || val.Contains("locked")))
+						{
+							isLocked = true;
+							lockReason = val;
+							break;
+						}
+					}
+				}
+
+				// Try to get Button component (locked modes may not have one)
+				Button btn = child.GetComponent<Button>();
+				// If no button but not explicitly locked, check interactability
+				if (btn != null && !((Selectable)btn).interactable)
+					isLocked = true;
+
+				_gameModeEntries.Add(new GameModeEntry
+				{
+					Name = label,
+					IsLocked = isLocked,
+					LockReason = lockReason,
+					Button = btn,
+					GameObject = child.gameObject
+				});
 			}
 		}
 		catch (Exception ex)
 		{
-			DebugLogger.Log(LogCategory.Handler, "MainMenuHandler", "ScanDeckCards failed: " + ex.Message);
+			DebugLogger.Log(LogCategory.Handler, "MainMenu", "ScanGameModes failed: " + ex.Message);
 		}
-
-		if (_deckCards.Count == 0)
-		{
-			ScreenReader.Say(Loc.Get("deck_no_cards"));
-			return;
-		}
-
-		_browsingDeck = true;
-		_deckCardIndex = 0;
-		_deckDetailLevel = 0;
-		ScreenReader.Say(Loc.Get("deck_browsing", _deckCards.Count));
-		AnnounceDeckCard();
 	}
 
-	/// <summary>Finds a deck-related container to scope card scanning.</summary>
-	private GameObject FindDeckContainer()
-	{
-		try
-		{
-			// Look for common deck container names
-			string[] deckNames = { "DeckTray", "PlayDeckTray", "DeckList", "DeckCards", "CardList", "SelectDeck" };
-			Il2CppArrayBase<Transform> all = Object.FindObjectsOfType<Transform>();
-			if (all == null) return null;
-			for (int i = 0; i < all.Count; i++)
-			{
-				Transform t = all[i];
-				if ((Object)(object)t == (Object)null) continue;
-				if (!t.gameObject.activeInHierarchy) continue;
-				string name = ((Object)t.gameObject).name;
-				foreach (string dn in deckNames)
-				{
-					if (name.Contains(dn, StringComparison.OrdinalIgnoreCase))
-					{
-						// Must have CardViews as children
-						Il2CppArrayBase<CardView> cvs = t.gameObject.GetComponentsInChildren<CardView>(false);
-						if (cvs != null && cvs.Count > 0)
-							return t.gameObject;
-					}
-				}
-			}
-		}
-		catch { }
-		return null;
-	}
-
-	private void ProcessDeckInput()
+	private void ProcessGameModesInput()
 	{
 		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
 		{
-			_deckCardIndex = (_deckCardIndex - 1 + _deckCards.Count) % _deckCards.Count;
-			_deckDetailLevel = 0;
-			AnnounceDeckCard();
+			if (_gameModeEntries.Count == 0) return;
+			_gameModeIndex = (_gameModeIndex - 1 + _gameModeEntries.Count) % _gameModeEntries.Count;
+			AnnounceGameMode();
 		}
 		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
 		{
-			_deckCardIndex = (_deckCardIndex + 1) % _deckCards.Count;
-			_deckDetailLevel = 0;
-			AnnounceDeckCard();
+			if (_gameModeEntries.Count == 0) return;
+			_gameModeIndex = (_gameModeIndex + 1) % _gameModeEntries.Count;
+			AnnounceGameMode();
 		}
 		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
 		{
-			if (_deckDetailLevel < 3) _deckDetailLevel++;
-			AnnounceDeckDetail();
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
-		{
-			if (_deckDetailLevel > 0)
+			// Read details
+			if (_gameModeIndex >= 0 && _gameModeIndex < _gameModeEntries.Count)
 			{
-				_deckDetailLevel--;
-				if (_deckDetailLevel == 0) AnnounceDeckCard();
-				else AnnounceDeckDetail();
-			}
-			else
-			{
-				_browsingDeck = false;
-				_deckDetailLevel = 0;
-				ScreenReader.Say(Loc.Get("deck_exit"));
+				var mode = _gameModeEntries[_gameModeIndex];
+				if (mode.IsLocked && !string.IsNullOrEmpty(mode.LockReason))
+					ScreenReader.Say(mode.LockReason);
+				else if (mode.IsLocked)
+					ScreenReader.Say("This mode is locked.");
+				else
+					ScreenReader.Say(mode.Name + ". Press Enter to open.");
 			}
 		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Escape) || SDLInput.IsKeyDown(SDLInput.Key.Backspace))
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
 		{
-			_browsingDeck = false;
-			_deckDetailLevel = 0;
-			ScreenReader.Say(Loc.Get("deck_exit"));
-		}
-	}
-
-	private void AnnounceDeckCard()
-	{
-		if (_deckCardIndex < 0 || _deckCardIndex >= _deckCards.Count) return;
-		string name = GetDeckCardName(_deckCards[_deckCardIndex]);
-		ScreenReader.Say(Loc.Get("deck_card", name, _deckCardIndex + 1, _deckCards.Count));
-	}
-
-	private void AnnounceDeckDetail()
-	{
-		if (_deckCardIndex < 0 || _deckCardIndex >= _deckCards.Count) return;
-		CardView card = _deckCards[_deckCardIndex];
-
-		switch (_deckDetailLevel)
-		{
-			case 1:
-				try
-				{
-					CardValueView cv = ((CardRenderer)card)._CostValueView;
-					if ((Object)(object)cv != (Object)null) { ScreenReader.Say(Loc.Get("deck_card_cost", cv.Value)); return; }
-				}
-				catch { }
-				ScreenReader.Say(Loc.Get("deck_card_cost", "?"));
-				break;
-			case 2:
-				try
-				{
-					CardValueView pv = ((CardRenderer)card)._PowerValueView;
-					if ((Object)(object)pv != (Object)null) { ScreenReader.Say(Loc.Get("deck_card_power", pv.Value)); return; }
-				}
-				catch { }
-				ScreenReader.Say(Loc.Get("deck_card_power", "?"));
-				break;
-			case 3:
-				string ability = GetDeckCardAbility(card);
-				ScreenReader.Say(!string.IsNullOrEmpty(ability) ? ability : Loc.Get("deck_card_no_ability"));
-				break;
-		}
-	}
-
-	private string GetDeckCardName(CardView card)
-	{
-		if ((Object)(object)card == (Object)null) return null;
-		// 1. Try CardRenderer.CardName
-		try
-		{
-			string n = ((CardRenderer)card).CardName;
-			if (!string.IsNullOrEmpty(n)) return UIHelper.StripRichText(n);
-		}
-		catch { }
-		// 2. Try CardDefId
-		try
-		{
-			var id = card.CardDefId;
-			if (id != null) { string s = id.ToString(); if (!string.IsNullOrEmpty(s) && s != "0") return UIHelper.StripRichText(s); }
-		}
-		catch { }
-		// 3. Try TMP_Text children — look for the name label (short text, not a number, not ability text)
-		try
-		{
-			Il2CppArrayBase<TMP_Text> texts = ((Component)card).GetComponentsInChildren<TMP_Text>(false);
-			if (texts != null)
+			if (_gameModeIndex >= 0 && _gameModeIndex < _gameModeEntries.Count)
 			{
-				for (int i = 0; i < texts.Count; i++)
+				var mode = _gameModeEntries[_gameModeIndex];
+				if (mode.IsLocked)
 				{
-					TMP_Text tmp = texts[i];
-					if ((Object)(object)tmp == (Object)null) continue;
-					if (!((Component)tmp).gameObject.activeInHierarchy) continue;
-					string t = UIHelper.StripRichText(tmp.text ?? "").Trim();
-					// Card names are typically 3-30 chars, not numbers, not ability descriptions
-					if (t.Length >= 2 && t.Length <= 35 && !int.TryParse(t, out _)
-					    && !t.Contains("Ongoing:") && !t.Contains("On Reveal:")
-					    && !t.Contains("Activate:") && !t.Contains("When"))
+					ScreenReader.Say("Locked. " + (string.IsNullOrEmpty(mode.LockReason) ? "" : mode.LockReason));
+				}
+				else if (mode.Button != null)
+				{
+					ScreenReader.Say("Opening " + mode.Name);
+					if (!UIHelper.ClickButton(mode.Button))
+						UIHelper.SimulateMouseClick(mode.GameObject);
+					_inGameModes = false;
+					_inSubScreen = true;
+					_dialogHandler.ResetWithDelay(0.8f);
+				}
+			}
+		}
+		// Backspace handled by HandleBackCommand
+	}
+
+	private void AnnounceGameMode()
+	{
+		if (_gameModeIndex < 0 || _gameModeIndex >= _gameModeEntries.Count) return;
+		var mode = _gameModeEntries[_gameModeIndex];
+		string locked = mode.IsLocked ? ", locked" : "";
+		ScreenReader.Say(mode.Name + locked + ", " + (_gameModeIndex + 1) + " of " + _gameModeEntries.Count);
+	}
+
+	// --- Collection ---
+
+	private void EnterCollection()
+	{
+		_browsingCollection = true;
+		_inSubScreen = true;
+		_collectionSectionIndex = 0;
+        _collectionIndex = 0;
+		_collectionLevel = 0;
+		MelonCoroutines.Start(ScanCollectionDelayed());
+	}
+
+	private IEnumerator ScanCollectionDelayed()
+	{
+		// Collection scene needs time to load — retry up to 5 times
+		for (int attempt = 0; attempt < 5; attempt++)
+		{
+			yield return new WaitForSeconds(attempt == 0 ? 1.0f : 0.5f);
+			ScanCollectionSections();
+			if (_collectionSections.Count > 0) break;
+		}
+
+		if (_collectionSections.Count > 0)
+		{
+			_collectionLevel = 0;
+			ScreenReader.Say("Collection. " + _collectionSections.Count + " categories. Left and Right to browse, Enter to open.");
+			ScreenReader.SayQueued(_collectionSections[_collectionSectionIndex] + ", 1 of " + _collectionSections.Count);
+		}
+		else ScreenReader.Say("Collection is empty or loading.");
+	}
+
+	private void ProcessCollectionInput()
+	{
+		// Delete confirmation takes priority
+		if (_deleteConfirmMode)
+		{
+			ProcessDeleteConfirm();
+			return;
+		}
+
+		// Deck action mode: waiting for E/D/C key after pressing Enter on a deck
+		if (_deckActionMode)
+		{
+			ProcessDeckAction();
+			return;
+		}
+
+		// Level 0: Category navigation
+		if (_collectionLevel == 0)
+		{
+			if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+			{
+				if (_collectionSections.Count == 0) return;
+				_collectionSectionIndex = (_collectionSectionIndex - 1 + _collectionSections.Count) % _collectionSections.Count;
+				ScreenReader.Say(_collectionSections[_collectionSectionIndex] + ", " + (_collectionSectionIndex + 1) + " of " + _collectionSections.Count);
+			}
+			else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+			{
+				if (_collectionSections.Count == 0) return;
+				_collectionSectionIndex = (_collectionSectionIndex + 1) % _collectionSections.Count;
+				ScreenReader.Say(_collectionSections[_collectionSectionIndex] + ", " + (_collectionSectionIndex + 1) + " of " + _collectionSections.Count);
+			}
+			else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+			{
+				// Preview item count
+				ScanCollectionCardsInSection(_collectionSectionIndex);
+				ScreenReader.Say(_collectionSections[_collectionSectionIndex] + ": " + _collectionCards.Count + " items.");
+			}
+			else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+			{
+				// Enter category
+				ScanCollectionCardsInSection(_collectionSectionIndex);
+				_collectionIndex = 0;
+				_collectionLevel = 1;
+				if (_collectionCards.Count > 0)
+				{
+					ScreenReader.Say(_collectionSections[_collectionSectionIndex] + ", " + _collectionCards.Count + " items.");
+					ScreenReader.SayQueued(_collectionCards[0].Name + ", 1 of " + _collectionCards.Count);
+				}
+				else
+				{
+					ScreenReader.Say(_collectionSections[_collectionSectionIndex] + " is empty.");
+				}
+			}
+			// Backspace handled in HandleBackCommand
+			return;
+		}
+
+		// Level 1: Items within category
+		// Left: previous item
+		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+		{
+			if (_collectionCards.Count == 0) return;
+			_collectionIndex = (_collectionIndex - 1 + _collectionCards.Count) % _collectionCards.Count;
+			AnnounceCollectionCard();
+		}
+		// Right: next item
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+		{
+			if (_collectionCards.Count == 0) return;
+			_collectionIndex = (_collectionIndex + 1) % _collectionCards.Count;
+			AnnounceCollectionCard();
+		}
+		// Down: read card details (cost, power)
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+		{
+			ReadCollectionCardInfo();
+		}
+		// Enter: activate card or enter deck action mode
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+		{
+			if (_collectionIndex >= 0 && _collectionIndex < _collectionCards.Count)
+			{
+				var card = _collectionCards[_collectionIndex];
+				if (card.IsDeckSlot && card.Name != "New Deck")
+				{
+					// Enter deck action mode for existing decks
+					_deckActionMode = true;
+					// Click the deck to select it first
+					if (!UIHelper.SendPointerClick(card.Button.gameObject))
+						UIHelper.SimulateMouseClick(card.Button.gameObject);
+					ScreenReader.Say(card.Name + ". E to edit, D to delete, C to copy code, Backspace to cancel.");
+				}
+				else if (card.IsDeckSlot && card.Name == "New Deck")
+				{
+					ScreenReader.Say("Creating new deck.");
+					Button innerBtn = UIHelper.FindButtonInChildren(card.Button.transform, "Btn_Control");
+					if (innerBtn != null)
+						UIHelper.ClickButtonWithFallback(innerBtn);
+					else
+						UIHelper.SimulateMouseClick(card.Button.gameObject);
+				}
+				else
+				{
+					ScreenReader.Say("Activating " + card.Name);
+					UIHelper.ClickButton(card.Button);
+				}
+			}
+		}
+		// Backspace goes back to categories (handled in HandleBackCommand)
+	}
+
+	// --- Delete confirmation state ---
+	private bool _deleteConfirmMode = false;
+	private Button _deleteConfirmButton = null;
+	private Button _deleteCancelButton = null;
+	private int _deleteConfirmIndex = 0; // 0=cancel, 1=confirm
+
+	private void ProcessDeckAction()
+	{
+		if (SDLInput.IsKeyDown(SDLInput.Key.E))
+		{
+			_deckActionMode = false;
+			try
+			{
+				GameObject deckEditOptions = GameObject.Find("DeckEditOptions");
+				if (deckEditOptions != null)
+				{
+					Button backBtn = UIHelper.FindButtonInChildren(deckEditOptions.transform, "btn_back");
+					if (backBtn != null)
 					{
-						return t;
+						UIHelper.ClickButton(backBtn);
+						ScreenReader.Say("Editing deck.");
+						return;
 					}
 				}
 			}
+			catch { }
+			ScreenReader.Say("Edit not available.");
 		}
-		catch { }
-		// 4. Fallback: clean GameObject name but skip "Variant List" and "Card View" patterns
-		try
+		else if (SDLInput.IsKeyDown(SDLInput.Key.D))
 		{
-			string goName = ((Object)((Component)card).gameObject).name;
-			if (goName.Contains("Variant", StringComparison.OrdinalIgnoreCase)
-			    || goName.Contains("Card View", StringComparison.OrdinalIgnoreCase)
-			    || goName.Contains("Album", StringComparison.OrdinalIgnoreCase))
+			_deckActionMode = false;
+			try
 			{
-				return null; // Don't return useless names
+				GameObject deckEditOptions = GameObject.Find("DeckEditOptions");
+				if (deckEditOptions != null)
+				{
+					Button discardBtn = UIHelper.FindButtonInChildren(deckEditOptions.transform, "btn_discard");
+					if (discardBtn != null)
+					{
+						if (!UIHelper.SendPointerClick(((Component)discardBtn).gameObject))
+							UIHelper.SimulateMouseClick(((Component)discardBtn).gameObject);
+						// Enter delete confirm mode — wait for confirm dialog to appear
+						_deleteConfirmMode = true;
+						_deleteConfirmIndex = 0;
+						MelonCoroutines.Start(ScanForDeleteConfirm());
+						return;
+					}
+				}
 			}
-			string g = UIHelper.CleanGameObjectName(goName);
-			if (!string.IsNullOrEmpty(g) && g != "Card") return g;
+			catch { }
+			ScreenReader.Say("Delete not available.");
 		}
-		catch { }
-		return null;
+		else if (SDLInput.IsKeyDown(SDLInput.Key.C))
+		{
+			_deckActionMode = false;
+			try
+			{
+				GameObject deckEditOptions = GameObject.Find("DeckEditOptions");
+				if (deckEditOptions != null)
+				{
+					Button copyBtn = UIHelper.FindButtonInChildren(deckEditOptions.transform, "btn_copy");
+					if (copyBtn != null)
+					{
+						UIHelper.ClickButton(copyBtn);
+						ScreenReader.Say("Deck code copied to clipboard.");
+						return;
+					}
+				}
+			}
+			catch { }
+			ScreenReader.Say("Copy not available.");
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape))
+		{
+			_deckActionMode = false;
+			ScreenReader.Say("Cancelled.");
+		}
 	}
 
-	private string GetDeckCardAbility(CardView card)
+	private IEnumerator ScanForDeleteConfirm()
 	{
-		if ((Object)(object)card == (Object)null) return "";
+		// Wait for confirm dialog to appear
+		for (int attempt = 0; attempt < 6; attempt++)
+		{
+			yield return new WaitForSeconds(0.3f);
+			// Look for "Do it!" and "Cancel" buttons in Canvas-Dialogs or any popup
+			Button[] allBtns = Object.FindObjectsOfType<Button>();
+			foreach (var btn in allBtns)
+			{
+				if (btn == null || !btn.gameObject.activeInHierarchy) continue;
+				string label = UIHelper.GetButtonLabel(btn);
+				if (string.IsNullOrEmpty(label)) continue;
+				if (label.Contains("Do it", StringComparison.OrdinalIgnoreCase))
+					_deleteConfirmButton = btn;
+				else if (label.Equals("Cancel", StringComparison.OrdinalIgnoreCase))
+					_deleteCancelButton = btn;
+			}
+			if (_deleteConfirmButton != null) break;
+		}
+
+		if (_deleteConfirmButton != null)
+		{
+			ScreenReader.Say("Delete deck? Left for Cancel, Right for Confirm. Enter to select.");
+			_deleteConfirmIndex = 0;
+		}
+		else
+		{
+			_deleteConfirmMode = false;
+			ScreenReader.Say("Confirm dialog not found.");
+		}
+	}
+
+	private void ProcessDeleteConfirm()
+	{
+		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+		{
+			_deleteConfirmIndex = 0;
+			ScreenReader.Say("Cancel");
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+		{
+			_deleteConfirmIndex = 1;
+			ScreenReader.Say("Confirm delete");
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+		{
+			_deleteConfirmMode = false;
+			if (_deleteConfirmIndex == 1 && _deleteConfirmButton != null)
+			{
+				ScreenReader.Say("Deleting deck.");
+				int countBefore = _collectionCards.Count;
+				string deckName = (_collectionIndex >= 0 && _collectionIndex < _collectionCards.Count)
+					? _collectionCards[_collectionIndex].Name : "deck";
+				// Try all click methods for maximum reliability
+				if (!UIHelper.ClickButtonWithFallback(_deleteConfirmButton))
+					UIHelper.SendPointerClick(((Component)_deleteConfirmButton).gameObject);
+				// Rescan after deletion and verify
+				MelonCoroutines.Start(RescanCollectionAfterDelete(countBefore, deckName));
+			}
+			else if (_deleteCancelButton != null)
+			{
+				ScreenReader.Say("Cancelled.");
+				UIHelper.ClickButton(_deleteCancelButton);
+			}
+			else
+			{
+				ScreenReader.Say("Cancelled.");
+			}
+			_deleteConfirmButton = null;
+			_deleteCancelButton = null;
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
+		{
+			_deleteConfirmMode = false;
+			if (_deleteCancelButton != null)
+				UIHelper.ClickButton(_deleteCancelButton);
+			ScreenReader.Say("Cancelled.");
+			_deleteConfirmButton = null;
+			_deleteCancelButton = null;
+		}
+	}
+
+	private IEnumerator RescanCollectionAfterDelete(int countBefore, string deletedName)
+	{
+		// Go back to category level — the game recycles UI objects and the old deck name
+		// stays stale. Re-entering the category forces a fresh scan.
+		_collectionLevel = 0;
+		_collectionCards.Clear();
+		yield return new WaitForSeconds(1.5f);
+
+		// Rescan to verify the deck was actually removed
+		ScanCollectionCardsInSection(_collectionSectionIndex);
+		int countAfter = _collectionCards.Count;
+		_collectionCards.Clear(); // Back to category level
+		_collectionLevel = 0;
+
+		if (countAfter < countBefore)
+		{
+			ScreenReader.Say("Deck deleted. Press Enter on Deck category to see updated list.");
+		}
+		else
+		{
+			// Deck was NOT actually deleted — game refused
+			ScreenReader.Say(deletedName + " could not be deleted. The game may be protecting this deck. Try equipping a different deck first.");
+		}
+		ScreenReader.SayQueued(_collectionSections[_collectionSectionIndex] + ", " + (_collectionSectionIndex + 1) + " of " + _collectionSections.Count);
+	}
+
+	private IEnumerator RescanCollectionDelayed()
+	{
+		yield return new WaitForSeconds(0.8f);
+		ScanCollectionCardsInSection(_collectionSectionIndex);
+		_collectionIndex = 0;
+		if (_collectionCards.Count > 0)
+			ScreenReader.Say(_collectionCards[_collectionIndex].Name + ", 1 of " + _collectionCards.Count);
+	}
+
+	private void ReadCollectionCardInfo()
+	{
+		if (_collectionIndex < 0 || _collectionIndex >= _collectionCards.Count) return;
+		var card = _collectionCards[_collectionIndex];
 		try
 		{
-			Il2CppArrayBase<TMP_Text> texts = ((Component)card).GetComponentsInChildren<TMP_Text>();
-			if (texts == null) return "";
-			string cardName = GetDeckCardName(card);
-			for (int i = 0; i < texts.Count; i++)
+			if (card.Renderer != null)
 			{
-				TMP_Text tmp = texts[i];
-				if ((Object)(object)tmp == (Object)null || !((Component)tmp).gameObject.activeInHierarchy) continue;
-				string text = tmp.text;
-				if (string.IsNullOrWhiteSpace(text)) continue;
-				text = UIHelper.StripRichText(text.Trim());
-				if (text.Length < 5 || text == cardName || int.TryParse(text, out _)) continue;
-				return text;
+				if (_collectionDetailLevel == 0)
+				{
+					var costView = card.Renderer._CostValueView;
+					if ((Object)(object)costView != (Object)null)
+						ScreenReader.Say("Cost " + costView.Value);
+					else
+						ScreenReader.Say("Cost unknown");
+				}
+				else
+				{
+					var powerView = card.Renderer._PowerValueView;
+					if ((Object)(object)powerView != (Object)null)
+						ScreenReader.Say("Power " + powerView.Value);
+					else
+						ScreenReader.Say("Power unknown");
+				}
+				_collectionDetailLevel = (_collectionDetailLevel + 1) % 2;
+			}
+			else
+			{
+				ScreenReader.Say(card.Name);
+			}
+		}
+		catch { ScreenReader.Say(card.Name); }
+	}
+
+	private void AnnounceCollectionCard()
+	{
+		if (_collectionCards.Count == 0) return;
+		_collectionDetailLevel = 0;
+		var card = _collectionCards[_collectionIndex];
+		// For deck section items, add "Deck:" prefix for clarity
+		string isDeckSlot = card.Button != null && card.Button.gameObject.name == "DeckSlotCell" ? "Deck: " : "";
+		string suffix = card.Name == "New Deck" ? ". Press Enter to create." : "";
+		ScreenReader.Say(isDeckSlot + card.Name + suffix + ", " + (_collectionIndex + 1) + " of " + _collectionCards.Count);
+	}
+
+	private void ScanCollectionSections()
+	{
+		_collectionSections.Clear();
+		GameObject rootObj = GameObject.Find("CollectionContentLayoutGroup");
+        if (rootObj == null) return;
+        Transform root = rootObj.transform;
+		for (int i = 0; i < root.childCount; i++)
+		{
+			var child = root.GetChild(i);
+			if (child.gameObject.activeInHierarchy && child.name.Contains("SectionContainer"))
+			{
+				// Skip DeckEditSectionContainer — it's the deck editor, not a browsable category
+				if (child.name.Contains("DeckEdit")) continue;
+				string name = child.name.Replace("SectionContainer", "").Replace("Section", "");
+				if (string.IsNullOrEmpty(name)) name = "Items";
+				_collectionSections.Add(name);
+			}
+		}
+	}
+
+	private void ScanCollectionCardsInSection(int sectionIdx)
+	{
+		_collectionCards.Clear();
+		GameObject rootObj = GameObject.Find("CollectionContentLayoutGroup");
+		if (rootObj == null) return;
+		Transform root = rootObj.transform;
+
+		Transform section = null;
+		int sCount = 0;
+		for (int i = 0; i < root.childCount; i++)
+		{
+			if (root.GetChild(i).gameObject.activeInHierarchy && root.GetChild(i).name.Contains("SectionContainer"))
+			{
+				if (sCount == sectionIdx) { section = root.GetChild(i); break; }
+				sCount++;
+			}
+		}
+		if (section == null) return;
+
+		// Skip DeckEditSectionContainer entirely
+		if (section.name.Contains("DeckEdit")) return;
+
+		// Determine if this is a Deck section (only DeckSlotCell buttons should appear)
+		bool isDeckSection = section.name.Contains("Deck");
+
+		// Track seen names to avoid duplicates from pooled objects
+		HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+		Button[] btns = section.GetComponentsInChildren<Button>(true);
+		foreach (var b in btns)
+		{
+			if (!b.gameObject.activeInHierarchy) continue;
+			if (b.name.Contains("Mastery")) continue;
+			if (b.name.Contains("filter_")) continue;
+			if (b.name.Contains("icon_")) continue;
+
+			// In Deck sections, only include DeckSlotCell buttons (not card views or editor buttons)
+			if (isDeckSection && b.gameObject.name != "DeckSlotCell") continue;
+
+			// For card buttons: try CardRenderer.CardName first (the actual card name)
+			string label = "";
+			CardRenderer foundRenderer = null;
+			if (!isDeckSection)
+			{
+				try
+				{
+					var cardRenderer = ((Component)b).GetComponentInChildren<CardRenderer>(true);
+					if (cardRenderer != null)
+					{
+						string cardName = cardRenderer.CardName;
+						if (!string.IsNullOrEmpty(cardName) && cardName.Length >= 2)
+						{
+							label = cardName;
+							foundRenderer = cardRenderer;
+						}
+					}
+				}
+				catch { }
+			}
+
+			// For deck slots: search for Text_Name TMP_Text specifically
+			if (string.IsNullOrEmpty(label) && b.gameObject.name == "DeckSlotCell")
+			{
+				try
+				{
+					Transform textNameTf = UIHelper.FindChildByName(((Component)b).transform, "Text_Name");
+					if ((Object)(object)textNameTf != (Object)null)
+					{
+						var tmpText = ((Component)textNameTf).GetComponent<TMP_Text>();
+						if ((Object)(object)tmpText != (Object)null && !string.IsNullOrWhiteSpace(tmpText.text))
+							label = UIHelper.StripRichText(tmpText.text.Trim());
+					}
+				}
+				catch { }
+			}
+
+			// For other buttons: fall back to TMP_Text / GetButtonLabel
+			if (string.IsNullOrEmpty(label))
+				label = UIHelper.GetButtonLabel(b);
+
+			if (string.IsNullOrEmpty(label) || label.Length < 2) continue;
+			if (label.Contains("Gridsize") || label.Contains("{Missing")) continue;
+			if (label == "Landscape Collection Card View" || label == "LandscapeCollectionCardView") continue;
+
+			// Rename empty deck slot to "New Deck" for clarity
+			if (label == "Deck Slot Cell" || label == "DeckSlotCell"
+				|| label.Equals("Deck name", StringComparison.OrdinalIgnoreCase)
+				|| label.Equals("Deck Name\u200B", StringComparison.OrdinalIgnoreCase))
+				label = "New Deck";
+
+			// Skip duplicates (pooled cards can appear multiple times)
+			if (seen.Contains(label)) continue;
+			seen.Add(label);
+
+			_collectionCards.Add(new CollectionCard { Name = label, Button = b, Renderer = foundRenderer, IsDeckSlot = (b.gameObject.name == "DeckSlotCell") });
+		}
+	}
+
+	// --- Rewards ---
+
+	private void ScanRewards()
+	{
+		_rewardEvents.Clear();
+		try
+		{
+			// CarouselStagingArea is instantiated as a clone — search by partial name
+			GameObject carousel = null;
+			Transform playScreen = GameObject.Find("PlayScreenLandscape(Clone)")?.transform;
+			if (playScreen != null)
+				carousel = UIHelper.FindChildByName(playScreen, "CarouselStagingArea(Clone)")?.gameObject;
+			if (carousel == null)
+			{
+				foreach (var go in Object.FindObjectsOfType<GameObject>())
+				{
+					if (go.name.StartsWith("CarouselStagingArea") && go.activeInHierarchy) { carousel = go; break; }
+				}
+			}
+			if (carousel == null) return;
+
+			// Find all Cells in the carousel and scan each as an event
+			Transform scrollContainer = UIHelper.FindChildByName(carousel.transform, "Container");
+			if ((Object)(object)scrollContainer == (Object)null) scrollContainer = carousel.transform;
+
+			for (int i = 0; i < scrollContainer.childCount; i++)
+			{
+				Transform cell = scrollContainer.GetChild(i);
+				if (!cell.gameObject.name.StartsWith("Cell")) continue;
+				if (!cell.gameObject.activeInHierarchy) continue;
+
+				// Only process Login Rewards cells (skip Tips, Vault promos, etc.)
+				bool isLoginReward = false;
+				Button seeAllBtn = null;
+				Button[] cellButtons = cell.GetComponentsInChildren<Button>(true);
+				foreach (var btn in cellButtons)
+				{
+					if (btn != null && ((Object)btn.gameObject).name == "btn_SeeAllRewards")
+					{
+						seeAllBtn = btn;
+						isLoginReward = true;
+						break;
+					}
+				}
+				if (!isLoginReward) continue;
+
+				var evt = new RewardEvent { SeeAllButton = seeAllBtn };
+
+				// Read event name from text_Header
+				evt.EventName = GetEventName(cell);
+				if (string.IsNullOrEmpty(evt.EventName)) evt.EventName = "Login Rewards";
+
+				// Read event end time
+				Transform headerSection = UIHelper.FindChildByName(cell, "HeaderSection");
+				if ((Object)(object)headerSection != (Object)null)
+				{
+					Transform countdown = UIHelper.FindChildByName(headerSection, "text_countdown");
+					if ((Object)(object)countdown != (Object)null)
+					{
+						var tmp = countdown.GetComponent<TMP_Text>();
+						if ((Object)(object)tmp != (Object)null)
+						{
+							string val = UIHelper.StripRichText(tmp.text);
+							if (!string.IsNullOrEmpty(val) && !val.Contains("--"))
+								evt.EventEndTime = val;
+						}
+					}
+				}
+
+				// Read next reward info (NextRewardDay section)
+				Transform nextRewardSlot = UIHelper.FindChildByName(cell, "NextRewardDay");
+				if ((Object)(object)nextRewardSlot != (Object)null)
+				{
+					ReadRewardSlot(nextRewardSlot, out evt.NextRewardDay, out evt.NextRewardCountdown, out evt.ExtraInfo);
+				}
+
+				// Read final reward info (FinalRewardDay section)
+				Transform finalRewardSlot = UIHelper.FindChildByName(cell, "FinalRewardDay");
+				if ((Object)(object)finalRewardSlot != (Object)null)
+				{
+					string dummy1, dummy2;
+					ReadRewardSlot(finalRewardSlot, out evt.FinalRewardDay, out dummy1, out dummy2);
+				}
+
+				_rewardEvents.Add(evt);
+			}
+		}
+		catch (Exception ex)
+		{
+			DebugLogger.Log(LogCategory.Handler, "MainMenu", "ScanRewards failed: " + ex.Message);
+		}
+	}
+
+	private void ReadRewardSlot(Transform slot, out string day, out string countdown, out string extra)
+	{
+		day = "";
+		countdown = "";
+		extra = "";
+		try
+		{
+			TMP_Text[] texts = slot.GetComponentsInChildren<TMP_Text>(true);
+			foreach (var t in texts)
+			{
+				if (t == null) continue;
+				string goName = ((Object)((Component)t).gameObject).name;
+				string val = UIHelper.StripRichText(t.text);
+				if (string.IsNullOrEmpty(val) || val.Contains("{Missing")) continue;
+
+				if (goName.Contains("text_Day")) day = val;
+				else if (goName.Contains("text_countdown"))
+				{
+					// "0m 0s" / "0h 0m" / "--h --m" = ready now
+					if (!val.Contains("0m 0s") && !val.Contains("0h 0m") && !val.Contains("--"))
+						countdown = val;
+				}
+				else if (goName == "Text" && val.Length > 3 && !val.Contains("Reward"))
+					extra = val; // e.g. "20 Ant Man Boosters"
+			}
+
+			// Also try to find reward description from BaseReward/TextContainer
+			Transform textContainer = UIHelper.FindChildByName(slot, "TextContainer");
+			if ((Object)(object)textContainer != (Object)null)
+			{
+				var tmp = textContainer.GetComponentInChildren<TMP_Text>(true);
+				if ((Object)(object)tmp != (Object)null)
+				{
+					string val = UIHelper.StripRichText(tmp.text);
+					if (!string.IsNullOrEmpty(val) && val.Length > 2)
+						extra = val;
+				}
+			}
+		}
+		catch { }
+	}
+
+	/// <summary>Extracts a human-readable event name from a carousel Cell's children.</summary>
+	private string GetEventName(Transform cell)
+	{
+		try
+		{
+			// Look for a Promo child whose name tells us the event type
+			for (int i = 0; i < cell.childCount; i++)
+			{
+				string childName = ((Object)cell.GetChild(i).gameObject).name;
+				if (childName.Contains("LoginBonus") || childName.Contains("LoginRewards"))
+				{
+					// Try to read the header text
+					Transform header = UIHelper.FindChildByName(cell, "text_Header");
+					if ((Object)(object)header != (Object)null)
+					{
+						var tmp = ((Component)header).GetComponent<TMP_Text>();
+						if ((Object)(object)tmp != (Object)null && !string.IsNullOrWhiteSpace(tmp.text))
+							return UIHelper.StripRichText(tmp.text.Trim());
+					}
+					return "Login Rewards";
+				}
+				if (childName.Contains("NewVariant")) return "New Variant";
+				if (childName.Contains("Tips")) return "Tips";
+				if (childName.Contains("CardsShop")) return "Card Shop";
+			}
+			// Deeper search for Promo_LoginRewards
+			var promos = cell.GetComponentsInChildren<Transform>(true);
+			foreach (var p in promos)
+			{
+				string pName = ((Object)p.gameObject).name;
+				if (pName.StartsWith("Promo_LoginRewards"))
+				{
+					Transform header = UIHelper.FindChildByName(p, "text_Header");
+					if ((Object)(object)header != (Object)null)
+					{
+						var tmp = ((Component)header).GetComponent<TMP_Text>();
+						if ((Object)(object)tmp != (Object)null && !string.IsNullOrWhiteSpace(tmp.text))
+							return UIHelper.StripRichText(tmp.text.Trim());
+					}
+					return "Login Rewards";
+				}
 			}
 		}
 		catch { }
 		return "";
 	}
 
-	private bool IsNumericLabel(string label)
+	private void ProcessRewardsInput()
 	{
-		if (string.IsNullOrEmpty(label)) return false;
-		foreach (char c in label)
+		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
 		{
-			if (!char.IsDigit(c) && c != ',' && c != '.' && c != '/' && c != ' ' && c != '%')
-				return false;
+			if (_rewardEvents.Count == 0) return;
+			_rewardIndex = (_rewardIndex - 1 + _rewardEvents.Count) % _rewardEvents.Count;
+			AnnounceReward();
 		}
-		return true;
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+		{
+			if (_rewardEvents.Count == 0) return;
+			_rewardIndex = (_rewardIndex + 1) % _rewardEvents.Count;
+			AnnounceReward();
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+		{
+			if (_rewardIndex >= 0 && _rewardIndex < _rewardEvents.Count)
+			{
+				var evt = _rewardEvents[_rewardIndex];
+				var details = new List<string>();
+				if (!string.IsNullOrEmpty(evt.NextRewardDay))
+				{
+					string next = "Next reward: " + evt.NextRewardDay;
+					if (!string.IsNullOrEmpty(evt.NextRewardCountdown))
+						next += " in " + evt.NextRewardCountdown;
+					else
+						next += ", available now";
+					details.Add(next);
+				}
+				if (!string.IsNullOrEmpty(evt.ExtraInfo))
+					details.Add(evt.ExtraInfo);
+				if (!string.IsNullOrEmpty(evt.FinalRewardDay))
+					details.Add("Final reward: " + evt.FinalRewardDay);
+				if (!string.IsNullOrEmpty(evt.EventEndTime))
+					details.Add("Event ends in " + evt.EventEndTime);
+				if (evt.SeeAllButton != null)
+					details.Add("Press Enter to see all rewards.");
+				ScreenReader.Say(details.Count > 0 ? string.Join(". ", details) : "No details available.");
+			}
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+		{
+			if (_rewardIndex < 0 || _rewardIndex >= _rewardEvents.Count) return;
+			var evt = _rewardEvents[_rewardIndex];
+			if (evt.SeeAllButton != null)
+			{
+				ScreenReader.Say("Opening " + evt.EventName + " rewards.");
+				UIHelper.ClickButtonWithFallback(evt.SeeAllButton);
+				// Transition to detail view after a short delay
+				MelonCoroutines.Start(EnterRewardDetailsDelayed());
+			}
+			else
+			{
+				ScreenReader.Say("No details available for this event.");
+			}
+		}
+		// Backspace handled in HandleBackCommand
 	}
 
-	private static readonly string[] _promoPatterns = new[]
+	private IEnumerator EnterRewardDetailsDelayed()
 	{
-		"challenger", "awaits", "welcome", "new season", "limited time",
-		"special offer", "featured", "upgrade", "unlock", "coming soon"
-	};
-
-	private bool IsPromoText(string text)
-	{
-		if (string.IsNullOrEmpty(text)) return false;
-		// Deck names are typically short (1-3 words). Long text near a Deck parent is likely promo.
-		if (text.Length > 30) return true;
-		foreach (string pattern in _promoPatterns)
+		// Wait for LoginBonusSubSceneContainer to appear
+		for (int attempt = 0; attempt < 5; attempt++)
 		{
-			if (text.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-				return true;
+			yield return new WaitForSeconds(0.4f);
+			ScanRewardDetails();
+			if (_rewardDays.Count > 0) break;
 		}
-		return false;
+		if (_rewardDays.Count > 0)
+		{
+			_browsingRewards = false;
+			_browsingRewardDetails = true;
+			_rewardDayIndex = 0;
+			ScreenReader.Say(_rewardDays.Count + " daily rewards. Left and Right to browse, Down for details.");
+			AnnounceRewardDay();
+		}
+		else
+		{
+			ScreenReader.Say("Could not load reward details.");
+		}
+	}
+
+	private void AnnounceReward()
+	{
+		if (_rewardIndex < 0 || _rewardIndex >= _rewardEvents.Count) return;
+		var evt = _rewardEvents[_rewardIndex];
+		string announcement = evt.EventName;
+		if (!string.IsNullOrEmpty(evt.NextRewardDay))
+		{
+			announcement += ", next: " + evt.NextRewardDay;
+			if (string.IsNullOrEmpty(evt.NextRewardCountdown))
+				announcement += " (ready)";
+			else
+				announcement += " in " + evt.NextRewardCountdown;
+		}
+		announcement += ", " + (_rewardIndex + 1) + " of " + _rewardEvents.Count;
+		ScreenReader.Say(announcement);
+	}
+
+	// --- Reward Detail Screen (LoginBonusSubSceneContainer) ---
+
+	private void ScanRewardDetails()
+	{
+		_rewardDays.Clear();
+		try
+		{
+			GameObject loginBonus = GameObject.Find("LoginBonusSubSceneContainer(Clone)");
+			if (loginBonus == null || !loginBonus.activeInHierarchy) return;
+
+			// Find the scroll container with Cells
+			Transform viewport = UIHelper.FindChildByName(loginBonus.transform, "Container");
+			if ((Object)(object)viewport == (Object)null) return;
+
+			// Each Cell contains multiple LoginDailyRewardSlot items
+			// We process Cells in reverse order (Cell 0 = latest days) to show chronological order
+			var cellList = new List<Transform>();
+			for (int i = 0; i < viewport.childCount; i++)
+			{
+				Transform cell = viewport.GetChild(i);
+				if (cell.gameObject.name.StartsWith("Cell") && cell.gameObject.activeInHierarchy)
+					cellList.Add(cell);
+			}
+
+			// Process cells in reverse so Day 1 comes first
+			for (int c = cellList.Count - 1; c >= 0; c--)
+			{
+				Transform cell = cellList[c];
+				Button[] slotButtons = cell.GetComponentsInChildren<Button>(true);
+				// Collect slots in this cell, then reverse for chronological order
+				var cellDays = new List<RewardDay>();
+				foreach (var btn in slotButtons)
+				{
+					if (btn == null || !btn.gameObject.activeInHierarchy) continue;
+					if (btn.gameObject.name != "ClaimButton") continue;
+
+					var day = new RewardDay { ClaimButton = btn };
+
+					// Read text children
+					TMP_Text[] texts = ((Component)btn).GetComponentsInChildren<TMP_Text>(true);
+					foreach (var t in texts)
+					{
+						if (t == null) continue;
+						string goName = ((Object)((Component)t).gameObject).name;
+						string val = UIHelper.StripRichText(t.text);
+						if (string.IsNullOrEmpty(val) || val.Contains("{Missing")) continue;
+
+						if (goName.Contains("text_Day"))
+							day.Day = val;
+						else if (goName.Contains("text_Reward"))
+							day.Reward = val;
+						else if (goName.Contains("text_countdown"))
+						{
+							if (!val.Contains("0m 0s") && !val.Contains("0h 0m") && !val.Contains("--"))
+								day.Countdown = val;
+						}
+						else if (goName == "Title")
+							day.Reward = val; // Title names like "Thou Shalt Not Retreat"
+						else if (goName == "PackText" && string.IsNullOrEmpty(day.Reward))
+							day.Reward = val + " Pack";
+						else if (goName.Contains("FinalReward") || goName.Contains("NextReward"))
+						{
+							// Skip these label texts
+						}
+					}
+
+					// Check if this slot is claimable via the button label
+					string btnLabel = UIHelper.GetButtonLabel(btn);
+					if (!string.IsNullOrEmpty(btnLabel) && btnLabel.StartsWith("Claim"))
+						day.IsClaimable = true;
+
+					// Only add if we found a day number
+					if (!string.IsNullOrEmpty(day.Day))
+						cellDays.Add(day);
+				}
+
+				// Reverse within cell so days go from lowest to highest
+				cellDays.Reverse();
+				_rewardDays.AddRange(cellDays);
+			}
+
+			DebugLogger.Log(LogCategory.Handler, "MainMenu", "ScanRewardDetails: found " + _rewardDays.Count + " daily rewards");
+		}
+		catch (Exception ex)
+		{
+			DebugLogger.Log(LogCategory.Handler, "MainMenu", "ScanRewardDetails failed: " + ex.Message);
+		}
+	}
+
+	private void ProcessRewardDetailsInput()
+	{
+		// Check if LoginBonusSubSceneContainer is still visible
+		GameObject loginBonus = GameObject.Find("LoginBonusSubSceneContainer(Clone)");
+		if (loginBonus == null || !loginBonus.activeInHierarchy)
+		{
+			_browsingRewardDetails = false;
+			_rewardDays.Clear();
+			_browsingRewards = true;
+			ScreenReader.Say("Reward details closed.");
+			AnnounceReward();
+			return;
+		}
+
+		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+		{
+			if (_rewardDays.Count == 0) return;
+			_rewardDayIndex = (_rewardDayIndex - 1 + _rewardDays.Count) % _rewardDays.Count;
+			AnnounceRewardDay();
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+		{
+			if (_rewardDays.Count == 0) return;
+			_rewardDayIndex = (_rewardDayIndex + 1) % _rewardDays.Count;
+			AnnounceRewardDay();
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+		{
+			if (_rewardDayIndex >= 0 && _rewardDayIndex < _rewardDays.Count)
+			{
+				var d = _rewardDays[_rewardDayIndex];
+				var details = new List<string>();
+				details.Add(d.Day);
+				if (!string.IsNullOrEmpty(d.Reward))
+					details.Add("Reward: " + d.Reward);
+				if (d.IsClaimable)
+				{
+					if (!string.IsNullOrEmpty(d.Countdown))
+						details.Add("Available in " + d.Countdown);
+					else
+						details.Add("Available to claim now. Press Enter to claim.");
+				}
+				else
+				{
+					details.Add("Already claimed or not yet available.");
+				}
+				ScreenReader.Say(string.Join(". ", details));
+			}
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+		{
+			if (_rewardDayIndex < 0 || _rewardDayIndex >= _rewardDays.Count) return;
+			var d = _rewardDays[_rewardDayIndex];
+			if (d.IsClaimable && string.IsNullOrEmpty(d.Countdown) && d.ClaimButton != null)
+			{
+				ScreenReader.Say("Claiming " + d.Day);
+				UIHelper.ClickButtonWithFallback(d.ClaimButton);
+			}
+			else if (d.IsClaimable && !string.IsNullOrEmpty(d.Countdown))
+			{
+				ScreenReader.Say("Not available yet. " + d.Countdown + " remaining.");
+			}
+			else
+			{
+				ScreenReader.Say("This reward cannot be claimed.");
+			}
+		}
+		// Backspace handled in HandleBackCommand
+	}
+
+	private void AnnounceRewardDay()
+	{
+		if (_rewardDayIndex < 0 || _rewardDayIndex >= _rewardDays.Count) return;
+		var d = _rewardDays[_rewardDayIndex];
+		string reward = !string.IsNullOrEmpty(d.Reward) ? ", " + d.Reward : "";
+		string status = "";
+		if (d.IsClaimable && string.IsNullOrEmpty(d.Countdown))
+			status = ", claimable";
+		else if (d.IsClaimable && !string.IsNullOrEmpty(d.Countdown))
+			status = ", in " + d.Countdown;
+		ScreenReader.Say(d.Day + reward + status + ", " + (_rewardDayIndex + 1) + " of " + _rewardDays.Count);
+	}
+
+	private void TryClickRewardDetailBackButton()
+	{
+		try
+		{
+			GameObject loginBonus = GameObject.Find("LoginBonusSubSceneContainer(Clone)");
+			if (loginBonus == null) return;
+			Transform backBtn = UIHelper.FindChildByName(loginBonus.transform, "Escape_BackButton");
+			if ((Object)(object)backBtn != (Object)null)
+			{
+				Button btn = backBtn.GetComponentInChildren<Button>(true);
+				if (btn != null) UIHelper.ClickButton(btn);
+				return;
+			}
+		}
+		catch { }
+		UIHelper.SimulateKeyPress(SDLInput.Key.Escape);
+	}
+
+	// --- Helpers ---
+
+	private bool FindNavigator()
+	{
+		if ((Object)(object)_navigator != (Object)null) return true;
+		_navigator = Object.FindObjectOfType<Navigator>();
+		return (Object)(object)_navigator != (Object)null;
+	}
+
+	private bool IsNavigatorVisible()
+	{
+		if ((Object)(object)_navigator == (Object)null) return false;
+		return _navigator.gameObject.activeInHierarchy;
+	}
+
+	private void OnNavigatorShown() { _focusIndex = 0; _dialogHandler.SuppressNextAnnounce = true; AnnounceFocused(); }
+	private void OnNavigatorHidden() { Reset(); }
+
+	public void Reset()
+	{
+		_onPlayScreen = false;
+		_browsingCollection = false;
+		_collectionLevel = 0;
+		_deckActionMode = false;
+		_deleteConfirmMode = false;
+		_deleteConfirmButton = null;
+		_deleteCancelButton = null;
+		_browsingRewards = false;
+		_browsingRewardDetails = false;
+		_inSubScreen = false;
+		_inGameModes = false;
+		_collectionCards.Clear();
+		_rewardEvents.Clear();
+		_rewardDays.Clear();
+		_gameModeEntries.Clear();
+	}
+
+	public void AnnounceContext()
+	{
+		if (_browsingRewardDetails) AnnounceRewardDay();
+		else if (_browsingRewards) AnnounceReward();
+		else if (_inGameModes) AnnounceGameMode();
+		else if (_onPlayScreen) AnnouncePlayCategory();
+		else if (_browsingCollection && _collectionLevel == 1) AnnounceCollectionCard();
+		else if (_browsingCollection) ScreenReader.Say(_collectionSections.Count > 0 ? _collectionSections[_collectionSectionIndex] : "Collection");
+		else AnnounceFocused();
+	}
+
+	private bool IsButtonActive(MenuEntry e) { return false; } 
+
+	private Button FindButtonUnder(Transform parent, string name)
+	{
+		Button[] btns = parent.GetComponentsInChildren<Button>(true);
+		foreach (var b in btns)
+		{
+			if (b.gameObject.name == name && b.gameObject.activeInHierarchy) return b;
+		}
+		return null;
+	}
+
+	private Button FindButtonByName(string name)
+	{
+		Button[] all = Object.FindObjectsOfType<Button>();
+		foreach (var b in all) if (b.gameObject.name == name && b.gameObject.activeInHierarchy) return b;
+		return null;
+	}
+
+	private void TryClickGameBackButton()
+	{
+		Button b = FindButtonByName("btn_back") ?? FindButtonByName("BackButton") ?? FindButtonByName("btn_close") ?? FindButtonByName("Esc");
+		if (b != null) UIHelper.ClickButton(b);
+		else UIHelper.SimulateKeyPress(SDLInput.Key.Escape);
+	}
+
+	private void TryOpenDeckEditor()
+	{
+		Button b = FindButtonByName("EditButton") ?? FindButtonByName("btn_edit");
+		if (b != null) UIHelper.ClickButton(b);
 	}
 }

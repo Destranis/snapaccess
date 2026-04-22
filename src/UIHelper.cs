@@ -9,6 +9,7 @@ using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppTMPro;
+using Il2CppSecondDinner.CubeRendering.Card;
 using Object = UnityEngine.Object;
 
 namespace SnapAccess;
@@ -331,8 +332,24 @@ public static class UIHelper
             TMP_Text tmp = ((Component)button).GetComponentInChildren<TMP_Text>(false);
             if ((Object)(object)tmp != (Object)null && !string.IsNullOrWhiteSpace(tmp.text))
             {
-                return StripRichText(tmp.text.Trim());
+                string cleaned = StripRichText(tmp.text.Trim());
+                // Skip broken localization entries — fall through to CardRenderer
+                if (!cleaned.Contains("{Missing") && cleaned.Length >= 2)
+                    return cleaned;
             }
+
+            // Try CardRenderer.CardName for card buttons (collection, deck builder, etc.)
+            try
+            {
+                var cardRenderer = ((Component)button).GetComponentInChildren<Il2CppSecondDinner.CubeRendering.Card.CardRenderer>(true);
+                if (cardRenderer != null)
+                {
+                    string cardName = cardRenderer.CardName;
+                    if (!string.IsNullOrEmpty(cardName) && cardName.Length >= 2)
+                        return cardName;
+                }
+            }
+            catch { }
 
             // "ClaimButton" with no text — try to read reward info from parent/siblings
             if (goName.Equals("ClaimButton", StringComparison.Ordinal))
@@ -444,6 +461,14 @@ public static class UIHelper
         return null;
     }
 
+    /// <summary>Finds a Button component in a child with the given name.</summary>
+    public static Button FindButtonInChildren(Transform parent, string name)
+    {
+        Transform child = FindChildByName(parent, name);
+        if ((Object)(object)child == (Object)null) return null;
+        return ((Component)child).GetComponent<Button>();
+    }
+
     public static string GetGameObjectPath(GameObject obj)
     {
         if ((Object)(object)obj == (Object)null) return "";
@@ -455,4 +480,16 @@ public static class UIHelper
         }
         return path;
     }
+
+    /// <summary>Simulates a keyboard press using Windows API.</summary>
+    public static void SimulateKeyPress(SDLInput.Key key)
+    {
+        byte vk = (byte)key;
+        keybd_event(vk, 0, 0, 0); // Key Down
+        keybd_event(vk, 0, 2, 0); // Key Up
+        DebugLogger.Log(LogCategory.Handler, "UIHelper", $"SimulateKeyPress: {key}");
+    }
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
 }

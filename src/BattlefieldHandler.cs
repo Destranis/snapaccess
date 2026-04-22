@@ -26,7 +26,11 @@ using Object = UnityEngine.Object;
 
 namespace SnapAccess;
 
-public class BattlefieldHandler
+/// <summary>
+/// Manages in-game accessibility features during a match.
+/// Handles hand/location navigation, card playing, and opponent state announcements.
+/// </summary>
+public class BattlefieldHandler : IHandler
 {
     private enum FocusArea
     {
@@ -106,6 +110,14 @@ public class BattlefieldHandler
     // Opponent name retry: name is often empty at game start
     private bool _opponentNameAnnounced = false;
 
+    // Turn phase tracking: detect "your turn" vs "waiting for opponent"
+    private bool _isPlayerTurn = false;
+    private bool _turnPhaseAnnounced = false;
+    private float _lastTurnPhaseCheck = 0f;
+
+    // Turn timer warning: announce once when timer is running low
+    private bool _timerWarningAnnounced = false;
+
     // Retreat confirmation: require double-press R within timeout
     private bool _retreatPending = false;
     private float _retreatPendingTime = 0f;
@@ -144,6 +156,8 @@ public class BattlefieldHandler
         }
         // Check for game over (Collect Rewards / Next button)
         CheckGameOver();
+        // Check turn phase (your turn vs waiting for opponent)
+        if (!_gameOverAnnounced) CheckTurnPhase();
         if (_inPopup)
         {
             ProcessPopupInput();
@@ -226,6 +240,10 @@ public class BattlefieldHandler
         _gameOverCheckTime = 0f;
         _opponentNameAnnounced = false;
         _retreatPending = false;
+        _isPlayerTurn = false;
+        _turnPhaseAnnounced = false;
+        _lastTurnPhaseCheck = 0f;
+        _timerWarningAnnounced = false;
     }
 
     private void Scan()
@@ -667,8 +685,8 @@ public class BattlefieldHandler
     {
         try
         {
-            // Track hand count for detecting turn changes
-            if (_handCards.Count != _lastHandCount)
+            // Track hand count for detecting turn changes — skip if game is over
+            if (!_gameOverAnnounced && _handCards.Count != _lastHandCount)
             {
                 if (_lastHandCount >= 0)
                 {
@@ -677,6 +695,7 @@ public class BattlefieldHandler
                     // (like "Cards cost Energy") should not be re-read every turn.
                     _lastLocString = "";
                     _turnChangeCount++;
+                    _timerWarningAnnounced = false;
                     // Enable opponent detection after the first turn change (cards dealt and resolved)
                     if (!_gameReadyForOpponentDetection && _turnChangeCount >= 1)
                     {
@@ -697,6 +716,11 @@ public class BattlefieldHandler
                             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                                 "Opponent name (delayed): " + oppName);
                         }
+                    }
+                    // Auto-announce turn info when a new turn starts (after initial deal)
+                    if (_turnChangeCount >= 2)
+                    {
+                        AutoAnnounceTurnStart();
                     }
                     // Announce newly drawn cards (skip initial deal — only after turn 1+)
                     if (_gameReadyForOpponentDetection && _handCards.Count > _lastHandCount && _previousHandEntityIds.Count > 0)
@@ -742,10 +766,24 @@ public class BattlefieldHandler
                 if (System.Text.RegularExpressions.Regex.IsMatch(text, @"^\d+\s*/\s*\d+$")) continue;
                 // Skip pure numeric strings (credit counters, XP values, etc.)
                 if (IsNumericOrCurrencyLabel(text)) continue;
-                // Skip timer countdown tooltips (Timer: 5, Timer: 4, etc.) — noisy and game auto-ends turn
-                if (text.StartsWith("Timer:", StringComparison.OrdinalIgnoreCase)) continue;
+                // Timer countdown tooltips (Timer: 5, Timer: 4, etc.) — announce warning at 10 seconds
+                if (text.StartsWith("Timer:", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!_timerWarningAnnounced)
+                    {
+                        string numPart = text.Substring(6).Trim();
+                        if (int.TryParse(numPart, out int seconds) && seconds <= 10)
+                        {
+                            _timerWarningAnnounced = true;
+                            ScreenReader.Say(seconds + " seconds left.");
+                        }
+                    }
+                    continue;
+                }
                 // Skip turn indicator tooltips (already available via T key)
                 if (text.StartsWith("turn ", StringComparison.OrdinalIgnoreCase) && text.Contains("/")) continue;
+                // Skip card cosmetic/rarity labels (Variant names, borders, finishes)
+                if (IsCardCosmeticText(text)) continue;
                 if (_announcedTooltips.Add(text))
                 {
                     _lastTutorialText = text;
@@ -2835,6 +2873,8 @@ public class BattlefieldHandler
             if (clicked || (Object)(object)gameView != (Object)null)
             {
                 ScreenReader.Say(Loc.Get("bf_end_turn"));
+                _isPlayerTurn = false;
+                _turnPhaseAnnounced = false;
             }
             else
             {
@@ -2928,7 +2968,15 @@ public class BattlefieldHandler
         if ((Object)(object)card == (Object)null) return;
 
         string cardName = GetCardName(card);
-        ScreenReader.Say(Loc.Get("bf_card_brief", cardName, _handIndex + 1, _handCards.Count));
+        string costStr = "";
+        try
+        {
+            CardValueView costView = ((CardRenderer)card)._CostValueView;
+            if ((Object)(object)costView != (Object)null)
+                costStr = costView.Value.ToString();
+        }
+        catch { }
+        ScreenReader.Say(Loc.Get("bf_card_brief", cardName, costStr, _handIndex + 1, _handCards.Count));
     }
 
     /// <summary>Announce location name and position only — down arrow for full details.</summary>
@@ -3024,6 +3072,113 @@ public class BattlefieldHandler
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "AnnounceTurnInfo failed: " + ex.Message);
             ScreenReader.Say(Loc.Get("bf_turn_not_available"));
         }
+    }
+
+    /// <summary>Auto-announces turn number, energy, and "your turn" when a new turn starts.</summary>
+    private void AutoAnnounceTurnStart()
+    {
+        try
+        {
+            List<string> parts = new List<string>();
+
+            // Get turn number
+            string turnText = GetTurnText();
+            if (!string.IsNullOrEmpty(turnText))
+            {
+                string[] split = turnText.Split('/');
+                if (split.Length == 2)
+                    parts.Add(Loc.Get("bf_turn_info", split[0].Trim(), split[1].Trim()));
+                else
+                    parts.Add(Loc.Get("bf_turn_info_raw", turnText));
+            }
+
+            // Get energy
+            string energy = GetEnergyText();
+            if (!string.IsNullOrEmpty(energy))
+                parts.Add($"Energy {energy}");
+
+            // Announce "Your turn"
+            parts.Add(Loc.Get("bf_your_turn"));
+
+            ScreenReader.SayQueued(string.Join(". ", parts));
+            _turnPhaseAnnounced = false; // Reset so we can announce "waiting" after they end turn
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "AutoAnnounceTurnStart failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>Gets the raw turn text (e.g. "3 / 6") without announcing it.</summary>
+    private string GetTurnText()
+    {
+        try
+        {
+            Il2CppArrayBase<TMP_Text> texts = Object.FindObjectsOfType<TMP_Text>();
+            if (texts == null) return null;
+            for (int i = 0; i < texts.Count; i++)
+            {
+                TMP_Text t = texts[i];
+                if ((Object)(object)t == (Object)null) continue;
+                if (!((Component)t).gameObject.activeInHierarchy) continue;
+                string goName = ((Object)((Component)t).gameObject).name;
+                if (goName.Contains("TurnCountText", StringComparison.OrdinalIgnoreCase))
+                {
+                    string val = t.text;
+                    if (!string.IsNullOrEmpty(val) && val.Contains("/"))
+                        return val.Trim();
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>Checks end turn button text to detect turn phase and announce changes.</summary>
+    private void CheckTurnPhase()
+    {
+        if (UnityEngine.Time.time - _lastTurnPhaseCheck < 1.0f) return;
+        _lastTurnPhaseCheck = UnityEngine.Time.time;
+
+        try
+        {
+            EndTurnButtonView endBtn = UIHelper.FindComponent<EndTurnButtonView>();
+            if ((Object)(object)endBtn == (Object)null) return;
+
+            Il2CppArrayBase<TMP_Text> texts = ((Component)endBtn).GetComponentsInChildren<TMP_Text>(false);
+            if (texts == null) return;
+
+            for (int i = 0; i < texts.Count; i++)
+            {
+                TMP_Text tmp = texts[i];
+                if ((Object)(object)tmp == (Object)null || !((Component)tmp).gameObject.activeInHierarchy) continue;
+                string text = tmp.text;
+                if (string.IsNullOrWhiteSpace(text)) continue;
+                text = UIHelper.StripRichText(text.Trim());
+
+                bool isWaiting = text.Contains("Wait", StringComparison.OrdinalIgnoreCase);
+                bool isEndTurn = text.Contains("End Turn", StringComparison.OrdinalIgnoreCase) ||
+                                 text.Contains("End", StringComparison.OrdinalIgnoreCase);
+
+                if (isWaiting && _isPlayerTurn)
+                {
+                    _isPlayerTurn = false;
+                    if (!_turnPhaseAnnounced)
+                    {
+                        _turnPhaseAnnounced = true;
+                        ScreenReader.SayQueued(Loc.Get("bf_waiting_for_opponent"));
+                    }
+                    return;
+                }
+                else if (isEndTurn && !isWaiting && !_isPlayerTurn && _turnChangeCount >= 1)
+                {
+                    _isPlayerTurn = true;
+                    _turnPhaseAnnounced = false;
+                    return;
+                }
+            }
+        }
+        catch { }
     }
 
     private void TrySnap()
@@ -3259,6 +3414,9 @@ public class BattlefieldHandler
         _gameOverCheckTime = 0f;
 
         _opponentNameAnnounced = false;
+        _isPlayerTurn = false;
+        _turnPhaseAnnounced = false;
+        _lastTurnPhaseCheck = 0f;
 
         // Read opponent name and announce game start
         string opponentName = ReadOpponentName();
@@ -3603,6 +3761,37 @@ public class BattlefieldHandler
     }
 
     /// <summary>Check if raw card text is flavor text (italic quoted text, not a real ability).</summary>
+    /// <summary>Returns true if the text is a card cosmetic label (variant, border, rarity, finish).</summary>
+    private static bool IsCardCosmeticText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        // Exact rarity/border matches
+        if (text.Equals("Common", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Uncommon", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Rare", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Epic", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Legendary", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Infinity", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Ultra", StringComparison.OrdinalIgnoreCase)) return true;
+        // Patterns: "X Border", "X Finish", "X Flare", "Base Card", "Series N"
+        if (text.EndsWith(" Border", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.EndsWith(" Finish", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.EndsWith(" Flare", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Contains("Variant", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Base Card", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.StartsWith("Series ", StringComparison.OrdinalIgnoreCase)) return true;
+        // Artist credit lines (e.g., "PANDART STUDIO Variant")
+        if (text.Contains("STUDIO", StringComparison.OrdinalIgnoreCase) || text.Contains("STUDIOS", StringComparison.OrdinalIgnoreCase)) return true;
+        // "Equipped Cosmetics", "Card Information", cosmetic detail labels
+        if (text.Equals("Equipped Cosmetics", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Card Information", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Contains("+ No Flare", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Contains("Base Finish", StringComparison.OrdinalIgnoreCase)) return true;
+        // "0/5 XP" style upgrade progress
+        if (System.Text.RegularExpressions.Regex.IsMatch(text, @"^\d+/\d+\s*XP$")) return true;
+        return false;
+    }
+
     private static bool IsFlavorText(string rawText)
     {
         if (string.IsNullOrEmpty(rawText)) return false;
