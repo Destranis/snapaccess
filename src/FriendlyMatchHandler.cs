@@ -13,13 +13,13 @@ namespace SnapAccess;
 /// Flat navigation: Left/Right between Create and Join.
 /// Enter activates directly. No sub-menus.
 /// </summary>
-public class FriendlyMatchHandler : IHandler
+public class FriendlyMatchHandler : IScreenNavigator
 {
     private enum FocusItem { Create, Join }
 
     private FocusItem _focus = FocusItem.Create;
     private bool _isActive = false;
-    private bool _activated = false;
+    private bool _activated = false; // Gate: only scan when explicitly activated by MainMenuHandler
     private bool _waitingForCode = false; // True when user is typing a join code
     private float _lastScanTime = 0f;
 
@@ -31,30 +31,31 @@ public class FriendlyMatchHandler : IHandler
     private Button _copyButton;
     private Button _shareButton;
 
-    public bool IsActive => _isActive && _activated;
+    public string NavigatorId => "FriendlyMatch";
+    public int Priority => 550;
+    public bool IsActive => _isActive;
 
-    /// <summary>Explicitly activate this handler (called from MainMenuHandler).</summary>
+    /// <summary>
+    /// Called by MainMenuHandler when user navigates to the Friendly Battle screen.
+    /// Without this gate, BattleModeView GameObjects could cause this navigator
+    /// to preempt MainMenuHandler when not intended.
+    /// </summary>
     public void Activate()
     {
         _activated = true;
-        _lastScanTime = 0f;
-        _focus = FocusItem.Create;
-        _waitingForCode = false;
+        _lastScanTime = 0f; // Force immediate scan
     }
 
-    public bool Update()
+    public void Update()
     {
-        if (!_activated) return false;
-
-        if (!ScanForScreen())
+        if (!_activated || !ScanForScreen())
         {
             _isActive = false;
-            return false;
+            return;
         }
 
         _isActive = true;
         ProcessInput();
-        return true;
     }
 
     private bool ScanForScreen()
@@ -168,7 +169,7 @@ public class FriendlyMatchHandler : IHandler
         if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
         {
             _waitingForCode = false;
-            ScreenReader.Say("Cancelled. Back to Friendly Battle.");
+            AnnouncementService.Instance.Announce(Loc.Get("fm_cancelled"));
             AnnounceFocus();
             return;
         }
@@ -184,19 +185,19 @@ public class FriendlyMatchHandler : IHandler
 
             if (string.IsNullOrWhiteSpace(code))
             {
-                ScreenReader.Say("No code entered. Type or paste a code first, then press Enter.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_no_code"));
                 return;
             }
 
             _waitingForCode = false;
             if (_joinButton != null)
             {
-                ScreenReader.Say("Joining match with code " + code);
+                AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("fm_joining", code));
                 UIHelper.ClickButtonWithFallback(_joinButton);
             }
             else
             {
-                ScreenReader.Say("Join button not found.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_join_not_found"));
             }
             return;
         }
@@ -210,9 +211,9 @@ public class FriendlyMatchHandler : IHandler
                 try { code = _codeInputField.text; } catch { }
             }
             if (string.IsNullOrWhiteSpace(code))
-                ScreenReader.Say("Code field is empty. Type or paste a code.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_code_empty"));
             else
-                ScreenReader.Say("Current code: " + code);
+                AnnouncementService.Instance.Announce(Loc.Get("fm_current_code", code));
         }
         // All other keys pass through to the input field
     }
@@ -221,11 +222,11 @@ public class FriendlyMatchHandler : IHandler
     {
         string name = _focus switch
         {
-            FocusItem.Create => "Create Match, 1 of 2",
-            FocusItem.Join => "Join Match, 2 of 2",
+            FocusItem.Create => Loc.Get("fm_focus_create"),
+            FocusItem.Join => Loc.Get("fm_focus_join"),
             _ => ""
         };
-        ScreenReader.Say(name);
+        AnnouncementService.Instance.Announce(name);
     }
 
     private void ReadDetails()
@@ -235,9 +236,9 @@ public class FriendlyMatchHandler : IHandler
             // Check if a code was already generated
             string existingCode = ReadGeneratedCode();
             if (!string.IsNullOrEmpty(existingCode))
-                ScreenReader.Say("Your match code: " + existingCode + ". Press Enter to copy.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_existing_code", existingCode));
             else
-                ScreenReader.Say("Press Enter to create a match and generate a code for your friend.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_create_hint"));
         }
         else
         {
@@ -247,9 +248,9 @@ public class FriendlyMatchHandler : IHandler
                 try { code = _codeInputField.text; } catch { }
             }
             if (!string.IsNullOrWhiteSpace(code))
-                ScreenReader.Say("Code entered: " + code + ". Press Enter to join.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_code_entered", code));
             else
-                ScreenReader.Say("Press Enter, then type or paste a match code from your friend.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_code_enter_hint"));
         }
     }
 
@@ -263,18 +264,18 @@ public class FriendlyMatchHandler : IHandler
             {
                 // Copy to clipboard
                 CopyToClipboard(existingCode);
-                ScreenReader.Say("Code copied: " + existingCode);
+                AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("fm_code_copied", existingCode));
             }
             else if (_createButton != null)
             {
-                ScreenReader.Say("Creating match...");
+                AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("fm_creating"));
                 UIHelper.ClickButtonWithFallback(_createButton);
                 // After creating, try to read the generated code
                 MelonLoader.MelonCoroutines.Start(AnnounceGeneratedCodeDelayed());
             }
             else
             {
-                ScreenReader.Say("Create button not found.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_create_not_found"));
             }
         }
         else // Join
@@ -289,11 +290,11 @@ public class FriendlyMatchHandler : IHandler
                 }
                 catch { }
                 _waitingForCode = true;
-                ScreenReader.Say("Type or paste match code, then press Enter to join. Backspace to cancel.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_enter_code"));
             }
             else
             {
-                ScreenReader.Say("Code input field not found.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_code_input_not_found"));
             }
         }
     }
@@ -347,11 +348,11 @@ public class FriendlyMatchHandler : IHandler
             if (!string.IsNullOrEmpty(code))
             {
                 CopyToClipboard(code);
-                ScreenReader.Say("Match code: " + code + ". Copied to clipboard. Share with your friend.");
+                AnnouncementService.Instance.Announce(Loc.Get("fm_match_code", code), AnnouncementPriority.High);
                 yield break;
             }
         }
-        ScreenReader.Say("Match created. Check screen for your code.");
+        AnnouncementService.Instance.Announce(Loc.Get("fm_match_created"));
     }
 
     private Button FindButton(string goNamePattern, string labelKeyword)
@@ -392,23 +393,44 @@ public class FriendlyMatchHandler : IHandler
         }
         catch { }
         if (!closed) UIHelper.SimulateKeyPress(SDLInput.Key.Escape);
-        _activated = false;
         _isActive = false;
+        _activated = false;
         _waitingForCode = false;
-        ScreenReader.Say("Closing Friendly Battle.");
+        AnnouncementService.Instance.Announce(Loc.Get("fm_closing"));
     }
 
     public void AnnounceContext()
     {
-        ScreenReader.Say("Friendly Battle. Left and Right to switch between Create and Join.");
+        AnnouncementService.Instance.Announce(Loc.Get("fm_help"), AnnouncementPriority.High);
         AnnounceFocus();
     }
 
-    public void Reset()
+    public void Deactivate()
     {
         _isActive = false;
         _activated = false;
         _waitingForCode = false;
+        _root = null;
+        _createButton = null;
+        _joinButton = null;
+        _codeInputField = null;
+        _copyButton = null;
+        _shareButton = null;
+    }
+
+    public void OnSceneChanged(string sceneName)
+    {
+        _isActive = false;
+        _activated = false;
+        _waitingForCode = false;
+        _focus = FocusItem.Create;
+        _root = null;
+        _createButton = null;
+        _joinButton = null;
+        _codeInputField = null;
+        _copyButton = null;
+        _shareButton = null;
+        _lastScanTime = 0f;
     }
 
     [DllImport("user32.dll")] private static extern bool OpenClipboard(IntPtr hWndNewOwner);

@@ -91,6 +91,10 @@
       <HintPath>$(Il2CppAssemblies)\Il2CppApp.View.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Il2CppApp.Shop">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Shop.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Il2CppApp.Navigator">
       <HintPath>$(Il2CppAssemblies)\Il2CppApp.Navigator.dll</HintPath>
       <Private>false</Private>
@@ -129,6 +133,34 @@
     </Reference>
     <Reference Include="Il2CppApp.Event">
       <HintPath>$(Il2CppAssemblies)\Il2CppApp.Event.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Collection">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Collection.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.State">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.State.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Play">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Play.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.Cube.Common">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.Cube.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.Cube.Common.Core">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.Cube.Common.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSecondDinner.Cube">
+      <HintPath>$(Il2CppAssemblies)\Il2CppSecondDinner.Cube.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppApp.Login">
+      <HintPath>$(Il2CppAssemblies)\Il2CppApp.Login.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.UIElementsModule">

@@ -30,7 +30,7 @@ namespace SnapAccess;
 /// Manages in-game accessibility features during a match.
 /// Handles hand/location navigation, card playing, and opponent state announcements.
 /// </summary>
-public class BattlefieldHandler : IHandler
+public class BattlefieldHandler : IScreenNavigator
 {
     private enum FocusArea
     {
@@ -59,6 +59,9 @@ public class BattlefieldHandler : IHandler
     private readonly List<CardView> _handCards = new List<CardView>();
     private readonly List<LocationView> _locations = new List<LocationView>();
 
+    // Key hold repeater for fast navigation (hold arrow → auto-repeat after 0.5s)
+    private readonly KeyHoldRepeater _holdRepeater = new KeyHoldRepeater();
+
     private GameInputManager _gim;
     private HandZoneController _handZone;
     private CardView _selectedCard;
@@ -70,7 +73,7 @@ public class BattlefieldHandler : IHandler
     private int _lastHandCount = -1;
     private bool _tapToContinueAnnounced = false;
     private bool _tutorialTextsInitialized = false;
-    private int _tutorialInitScanCount = 0;
+    private float _tutorialInitStartTime = 0f;
     private string _lastTapScanState = "";
 
     private static bool _harmonyPatched = false;
@@ -98,14 +101,20 @@ public class BattlefieldHandler : IHandler
     private string _lastPlayedCardName = null;
     private int _lastPlayedEntityId = -1;
     private int _handCountAfterPlay = -1;
-    private int _rollbackConfirmCycles = 0; // Wait several cycles before confirming success
+    private float _rollbackConfirmStartTime = 0f; // Time when rollback tracking started
+    private float _playVerifyTime = 0f; // When to verify a mouse-drag play actually worked
+    private int _playVerifyExpectedCount = -1; // Expected hand count if play succeeded
 
     // Opponent card detection: don't announce before the game has started properly
     private bool _gameReadyForOpponentDetection = false;
     private int _turnChangeCount = 0;
+    private float _opponentScanCooldownUntil = 0f; // Block scanning briefly after turn changes (animations)
 
     // Card draw tracking: EntityIds of cards that were in hand last scan
     private readonly HashSet<int> _previousHandEntityIds = new HashSet<int>();
+
+    // Deferred drawn cards: stored for on-demand announcement via D key
+    private string _deferredDrawnCardsMessage = null;
 
     // Opponent name retry: name is often empty at game start
     private bool _opponentNameAnnounced = false;
@@ -117,20 +126,30 @@ public class BattlefieldHandler : IHandler
 
     // Turn timer warning: announce once when timer is running low
     private bool _timerWarningAnnounced = false;
+    private TurnTimer _turnTimer;
+    private bool _turnTimerWarningFired = false; // Via TurnTimer component (not tooltip)
+    private bool _turnTimerUrgentFired = false;
+    private float _lastTimerCheck = 0f;
 
     // Retreat confirmation: require double-press R within timeout
     private bool _retreatPending = false;
     private float _retreatPendingTime = 0f;
     private const float RetreatConfirmTimeout = 3f;
 
-    private const float ScanInterval = 0.5f;
+    private float _forcePopupScanAfter = 0f;
+    private const float ScanInterval = 0.25f;
     private const uint MOUSEEVENTF_MOVE = 1u;
     private const uint MOUSEEVENTF_LEFTDOWN = 2u;
     private const uint MOUSEEVENTF_LEFTUP = 4u;
 
-    public bool IsActive => (Object)(object)_gim != (Object)null;
+    private bool _active = false;
+    public bool IsActive => _active;
 
-    public bool Update()
+    public string NavigatorId => "Battlefield";
+
+    public int Priority => 900;
+
+    public void Update()
     {
         bool shouldScan = UnityEngine.Time.time - _lastScanTime > ScanInterval;
         if (shouldScan)
@@ -145,10 +164,15 @@ public class BattlefieldHandler : IHandler
                 OnGameLeft();
                 _wasInGame = false;
             }
-            return false;
+            _active = false;
+            return;
         }
+        _active = true;
         // Only scan for popups when actually in a game
-        if (shouldScan) ScanForPopup();
+        // Also force scan shortly after Escape press to detect pause/retreat menu
+        bool forcePopupScan = _forcePopupScanAfter > 0f && Time.time >= _forcePopupScanAfter;
+        if (forcePopupScan) _forcePopupScanAfter = 0f;
+        if (shouldScan || forcePopupScan) ScanForPopup();
         if (!_wasInGame)
         {
             OnGameEntered();
@@ -158,37 +182,44 @@ public class BattlefieldHandler : IHandler
         CheckGameOver();
         // Check turn phase (your turn vs waiting for opponent)
         if (!_gameOverAnnounced) CheckTurnPhase();
+        // Check turn timer for warnings
+        if (!_gameOverAnnounced) CheckTurnTimer();
         if (_inPopup)
         {
             ProcessPopupInput();
         }
         else if (_gameOverAnnounced)
         {
-            // Game is over — don't process normal input (hand/locations).
-            // Just wait for the next popup in the results flow.
-            // Only allow E key to try collecting rewards again.
-            if (SDLInput.IsKeyDown(SDLInput.Key.E))
+            // Game is over — handle reward collection and upgrade animations.
+            // E: collect rewards / advance
+            if (SDLInput.IsKeyDown(SDLInput.Key.E) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
             {
                 TryEndTurn();
             }
+            // Space or Enter: skip upgrade animation if active
+            else if (SDLInput.IsKeyDown(SDLInput.Key.Space) || SDLInput.IsKeyDown(SDLInput.Key.Return))
+            {
+                TrySkipUpgradeAnimation();
+            }
+            // Scan for upgrade animation and announce what's happening
+            CheckPostGameScreen();
         }
         else
         {
             ProcessInput();
         }
-        return true;
     }
 
     public void AnnounceContext()
     {
         if ((Object)(object)_gim == (Object)null)
         {
-            ScreenReader.Say(Loc.Get("bf_not_in_game"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_not_in_game"), AnnouncementPriority.Normal);
             return;
         }
         if (!string.IsNullOrEmpty(_lastInstructionText))
         {
-            ScreenReader.Say(Loc.Get("bf_tutorial_instruction", _lastInstructionText));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_tutorial_instruction", _lastInstructionText), AnnouncementPriority.Normal);
         }
         switch (_area)
         {
@@ -199,11 +230,24 @@ public class BattlefieldHandler : IHandler
                 AnnounceCurrentLocation();
                 break;
         }
-        ScreenReader.SayQueued(Loc.Get("bf_help"));
+        AnnouncementService.Instance.Announce(Loc.Get("bf_help"), AnnouncementPriority.Low);
     }
 
-    public void Reset()
+    public void Deactivate()
     {
+        _active = false;
+        _holdRepeater.Reset();
+        // Clear popup state but keep Harmony patches and tutorial state
+        _inPopup = false;
+        _popupButtons.Clear();
+        _popupFocusIndex = -1;
+        _lastPopupText = "";
+        _forcePopupScanAfter = 0f;
+    }
+
+    public void OnSceneChanged(string sceneName)
+    {
+        _active = false;
         _gim = null;
         _handZone = null;
         _handCards.Clear();
@@ -219,31 +263,42 @@ public class BattlefieldHandler : IHandler
         _lastHandCount = -1;
         _tapToContinueAnnounced = false;
         _tutorialTextsInitialized = false;
-        _tutorialInitScanCount = 0;
+        _tutorialInitStartTime = 0f;
 
         _wasInGame = false;
         _inPopup = false;
         _popupButtons.Clear();
         _popupFocusIndex = -1;
         _lastPopupText = "";
+        _forcePopupScanAfter = 0f;
         _knownBoardCardEntityIds.Clear();
         _ourCardEntityIds.Clear();
         _previousHandEntityIds.Clear();
         _pendingOpponentAnnouncements.Clear();
+        _deferredDrawnCardsMessage = null;
         _lastPlayedCardName = null;
         _lastPlayedEntityId = -1;
         _handCountAfterPlay = -1;
-        _rollbackConfirmCycles = 0;
+        _rollbackConfirmStartTime = 0f;
+        _playVerifyTime = 0f;
+        _playVerifyExpectedCount = -1;
         _gameReadyForOpponentDetection = false;
+        _opponentScanCooldownUntil = 0f;
         _turnChangeCount = 0;
         _gameOverAnnounced = false;
         _gameOverCheckTime = 0f;
+        _lastPostGameCheck = 0f;
+        _lastPostGameAnnouncement = "";
         _opponentNameAnnounced = false;
         _retreatPending = false;
         _isPlayerTurn = false;
         _turnPhaseAnnounced = false;
         _lastTurnPhaseCheck = 0f;
         _timerWarningAnnounced = false;
+        _turnTimer = null;
+        _turnTimerWarningFired = false;
+        _turnTimerUrgentFired = false;
+        _endTurnGuardPending = false;
     }
 
     private void Scan()
@@ -271,7 +326,10 @@ public class BattlefieldHandler : IHandler
         ScanTutorialTooltip();
 
         // Announce opponent card plays — batch into one message to avoid interrupting
-        if (_pendingOpponentAnnouncements.Count > 0)
+        // Defer during turn-start cooldown so player hears turn info first and can act immediately
+        if (!ModSettings.Instance.OpponentAnnouncements)
+            _pendingOpponentAnnouncements.Clear();
+        else if (_pendingOpponentAnnouncements.Count > 0 && Time.time > _opponentScanCooldownUntil)
         {
             StringBuilder opponentMsg = new StringBuilder();
             while (_pendingOpponentAnnouncements.Count > 0)
@@ -279,8 +337,8 @@ public class BattlefieldHandler : IHandler
                 if (opponentMsg.Length > 0) opponentMsg.Append(". ");
                 opponentMsg.Append(_pendingOpponentAnnouncements.Dequeue());
             }
-            // Use SayQueued so it doesn't cut off current speech
-            ScreenReader.SayQueued(opponentMsg.ToString());
+            // Use Low priority so it doesn't cut off current speech
+            AnnouncementService.Instance.Announce(opponentMsg.ToString(), AnnouncementPriority.Low);
         }
     }
 
@@ -402,32 +460,48 @@ public class BattlefieldHandler : IHandler
                 if (_handCards.Count > _handCountAfterPlay)
                 {
                     // Card came back — play was rolled back by the game
-                    ScreenReader.Say(Loc.Get("bf_play_rolled_back", _lastPlayedCardName));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_play_rolled_back", _lastPlayedCardName), AnnouncementPriority.Immediate);
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                         $"Play rolled back: {_lastPlayedCardName} returned to hand (hand={_handCards.Count} > expected={_handCountAfterPlay})");
                     _lastPlayedCardName = null;
                     _lastPlayedEntityId = -1;
                     _handCountAfterPlay = -1;
-                    _rollbackConfirmCycles = 0;
+                    _rollbackConfirmStartTime = 0f;
                     // Announce tutorial hints explaining why the play was rejected
                     AnnounceActiveTutorialHints();
                 }
                 else
                 {
-                    // Hand hasn't grown — but wait several cycles before confirming
+                    // Hand hasn't grown — but wait before confirming
                     // The game may roll back the play with a delay
-                    _rollbackConfirmCycles++;
-                    if (_rollbackConfirmCycles >= 12) // ~6 seconds at 0.5s scan interval
+                    if (Time.time - _rollbackConfirmStartTime >= 6.0f)
                     {
                         // Card stayed on board long enough — play succeeded
                         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
-                            $"Play confirmed after {_rollbackConfirmCycles} cycles: {_lastPlayedCardName}");
+                            $"Play confirmed after {Time.time - _rollbackConfirmStartTime:F1}s: {_lastPlayedCardName}");
                         _lastPlayedCardName = null;
                         _lastPlayedEntityId = -1;
                         _handCountAfterPlay = -1;
-                        _rollbackConfirmCycles = 0;
+                        _rollbackConfirmStartTime = 0f;
                     }
                 }
+            }
+            // Delayed play verification: if mouse drag was used, check hand count after delay
+            if (_playVerifyTime > 0f && Time.time >= _playVerifyTime)
+            {
+                if (_handCards.Count > _playVerifyExpectedCount && _lastPlayedCardName != null)
+                {
+                    // Card is still in hand — the play failed silently
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_play_failed_silent", _lastPlayedCardName), AnnouncementPriority.Immediate);
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        $"Play verification failed: {_lastPlayedCardName} still in hand (expected {_playVerifyExpectedCount}, got {_handCards.Count})");
+                    _lastPlayedCardName = null;
+                    _lastPlayedEntityId = -1;
+                    _handCountAfterPlay = -1;
+                    _rollbackConfirmStartTime = 0f;
+                }
+                _playVerifyTime = 0f;
+                _playVerifyExpectedCount = -1;
             }
             // Log hand contents when count changes for debugging
             if (_handCards.Count != _lastHandCount)
@@ -449,8 +523,8 @@ public class BattlefieldHandler : IHandler
         }
     }
 
-    /// <summary>Announces names of newly drawn cards by comparing current hand EntityIds with previous scan.</summary>
-    private void AnnounceDrawnCards()
+    /// <summary>Stores names of newly drawn cards for on-demand announcement via D key.</summary>
+    private void StoreDrawnCards()
     {
         try
         {
@@ -467,15 +541,27 @@ public class BattlefieldHandler : IHandler
             }
             if (newCardNames.Count > 0)
             {
-                string msg = Loc.Get("bf_card_drawn", string.Join(", ", newCardNames));
-                ScreenReader.SayQueued(msg);
+                _deferredDrawnCardsMessage = Loc.Get("bf_card_drawn", string.Join(", ", newCardNames));
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
-                    "Drew: " + string.Join(", ", newCardNames));
+                    "Deferred draw: " + string.Join(", ", newCardNames));
             }
         }
         catch (Exception ex)
         {
-            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "AnnounceDrawnCards failed: " + ex.Message);
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "StoreDrawnCards failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>Announces stored drawn cards on demand (D key).</summary>
+    private void AnnounceStoredDrawnCards()
+    {
+        if (!string.IsNullOrEmpty(_deferredDrawnCardsMessage))
+        {
+            AnnouncementService.Instance.Announce(_deferredDrawnCardsMessage, AnnouncementPriority.Immediate);
+        }
+        else
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_new_draws"), AnnouncementPriority.Normal);
         }
     }
 
@@ -507,6 +593,21 @@ public class BattlefieldHandler : IHandler
             if (vp.y < 0.25f && vp.y > -0.1f) return true;
         }
         catch { }
+        return false;
+    }
+
+    /// <summary>Checks if a CardView is inside an object pool (not actually on the board).</summary>
+    private bool IsInObjectPool(CardView card)
+    {
+        Transform t = ((Component)card).transform;
+        for (int depth = 0; depth < 8 && t != null; depth++)
+        {
+            string name = ((Object)t.gameObject).name;
+            if (name.Contains("ObjectPool", StringComparison.Ordinal) ||
+                name.Contains("CardPool", StringComparison.Ordinal))
+                return true;
+            t = t.parent;
+        }
         return false;
     }
 
@@ -558,6 +659,9 @@ public class BattlefieldHandler : IHandler
         // Don't detect opponent cards until the game has properly started
         // (after the first turn change when cards are dealt)
         if (!_gameReadyForOpponentDetection) return;
+        // Wait for reveal animations to finish after turn changes
+        // Do NOT snapshot during cooldown — that would silently absorb opponent cards
+        if (Time.time < _opponentScanCooldownUntil) return;
         try
         {
             // Find ALL CardViews in the scene — same approach as ScanHandCards
@@ -589,10 +693,11 @@ public class BattlefieldHandler : IHandler
                 if (IsInHandZone(cv)) continue;
 
                 // Skip cards in object pools (not actually on the board)
+                // Check both the card's own name AND ancestor names, since pool cards
+                // are at paths like ObjectPoolManager/ObjectPool_CardView/CardView[X]
                 try
                 {
-                    string goName = ((Object)((Component)cv).gameObject).name;
-                    if (goName != null && (goName.Contains("ObjectPool") || goName.Contains("CardPool"))) continue;
+                    if (IsInObjectPool(cv)) continue;
                 }
                 catch { }
 
@@ -634,10 +739,19 @@ public class BattlefieldHandler : IHandler
                         }
                     }
 
+                    // Skip cards at unrevealed locations — they're still animating
+                    if (nearestLocName.Contains("revealed", StringComparison.OrdinalIgnoreCase) ||
+                        nearestLocName.Contains("next turn", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Remove from known so we can re-detect after reveal
+                        _knownBoardCardEntityIds.Remove(entityId);
+                        continue;
+                    }
+
                     string cardInfo = GetCardInfo(cv);
-                    string announcement = $"Opponent played {cardName}";
-                    if (!string.IsNullOrEmpty(cardInfo)) announcement += $", {cardInfo}";
-                    announcement += $" to {nearestLocName}";
+                    string announcement = Loc.Get("bf_opponent_played", cardName);
+                    if (!string.IsNullOrEmpty(cardInfo)) announcement += ", " + cardInfo;
+                    announcement += " " + Loc.Get("bf_opponent_at_location", nearestLocName);
                     _pendingOpponentAnnouncements.Enqueue(announcement);
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                         $"Opponent card: {cardName} (entity={entityId}) at {nearestLocName}");
@@ -696,6 +810,12 @@ public class BattlefieldHandler : IHandler
                     _lastLocString = "";
                     _turnChangeCount++;
                     _timerWarningAnnounced = false;
+                    _turnTimerWarningFired = false;
+                    _turnTimerUrgentFired = false;
+                    _deferredDrawnCardsMessage = null;
+                    // Cooldown: wait for card reveal animations to finish before scanning for opponent plays.
+                    // Cards fly/animate for ~3-5 seconds during the reveal phase.
+                    _opponentScanCooldownUntil = Time.time + 2.0f;
                     // Enable opponent detection after the first turn change (cards dealt and resolved)
                     if (!_gameReadyForOpponentDetection && _turnChangeCount >= 1)
                     {
@@ -712,20 +832,20 @@ public class BattlefieldHandler : IHandler
                         if (!string.IsNullOrEmpty(oppName))
                         {
                             _opponentNameAnnounced = true;
-                            ScreenReader.SayQueued($"Playing against {oppName}");
+                            AnnouncementService.Instance.Announce($"Playing against {oppName}", AnnouncementPriority.High);
                             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                                 "Opponent name (delayed): " + oppName);
                         }
                     }
                     // Auto-announce turn info when a new turn starts (after initial deal)
-                    if (_turnChangeCount >= 2)
+                    if (_turnChangeCount >= 2 && ModSettings.Instance.AutoTurnAnnounce)
                     {
                         AutoAnnounceTurnStart();
                     }
-                    // Announce newly drawn cards (skip initial deal — only after turn 1+)
+                    // Store drawn cards for on-demand announcement via D key (skip initial deal)
                     if (_gameReadyForOpponentDetection && _handCards.Count > _lastHandCount && _previousHandEntityIds.Count > 0)
                     {
-                        AnnounceDrawnCards();
+                        StoreDrawnCards();
                     }
                 }
                 // Update previous hand EntityIds for next comparison
@@ -748,8 +868,11 @@ public class BattlefieldHandler : IHandler
                 {
                     _lastInstructionText = text;
                     _lastTutorialText = text;
-                    ScreenReader.SayQueued(text);
-                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Instruction: " + text);
+                    if (ModSettings.Instance.TutorialMessages)
+                    {
+                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
+                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Instruction: " + text);
+                    }
                 }
             }
 
@@ -766,16 +889,22 @@ public class BattlefieldHandler : IHandler
                 if (System.Text.RegularExpressions.Regex.IsMatch(text, @"^\d+\s*/\s*\d+$")) continue;
                 // Skip pure numeric strings (credit counters, XP values, etc.)
                 if (IsNumericOrCurrencyLabel(text)) continue;
-                // Timer countdown tooltips (Timer: 5, Timer: 4, etc.) — announce warning at 10 seconds
+                // Timer countdown tooltips (Timer: 5, Timer: 4, etc.)
+                // Warn at 15 seconds (first warning) and again at 5 seconds (urgent)
                 if (text.StartsWith("Timer:", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!_timerWarningAnnounced)
+                    string numPart = text.Substring(6).Trim();
+                    if (int.TryParse(numPart, out int seconds))
                     {
-                        string numPart = text.Substring(6).Trim();
-                        if (int.TryParse(numPart, out int seconds) && seconds <= 10)
+                        if (!_timerWarningAnnounced && seconds <= 15)
                         {
                             _timerWarningAnnounced = true;
-                            ScreenReader.Say(seconds + " seconds left.");
+                            AnnouncementService.Instance.Announce(seconds + " seconds left.", AnnouncementPriority.Immediate);
+                        }
+                        else if (_timerWarningAnnounced && seconds <= 5)
+                        {
+                            // Urgent warning — announce exact seconds
+                            AnnouncementService.Instance.Announce(seconds + " seconds!", AnnouncementPriority.Immediate);
                         }
                     }
                     continue;
@@ -787,7 +916,7 @@ public class BattlefieldHandler : IHandler
                 if (_announcedTooltips.Add(text))
                 {
                     _lastTutorialText = text;
-                    ScreenReader.SayQueued(text);
+                    AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Tooltip: " + text);
                 }
             }
@@ -816,7 +945,7 @@ public class BattlefieldHandler : IHandler
                     if (text.Length >= 3 && _announcedTooltips.Add(text))
                     {
                         _lastTutorialText = text;
-                        ScreenReader.SayQueued(text);
+                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
                         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "SpeechBubble: " + text);
                     }
                 }
@@ -874,7 +1003,7 @@ public class BattlefieldHandler : IHandler
             {
                 _tapToContinueAnnounced = true;
                 _lastInstructionText = Loc.Get("bf_tap_to_continue");
-                ScreenReader.SayQueued(Loc.Get("bf_tap_to_continue"));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_tap_to_continue"), AnnouncementPriority.Low);
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinue state detected");
             }
             else if (!tapVisible && _tapToContinueAnnounced)
@@ -895,7 +1024,7 @@ public class BattlefieldHandler : IHandler
                     {
                         _lastInstructionText = text;
                         _lastTutorialText = text;
-                        ScreenReader.SayQueued(text);
+                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
                         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinueText: " + text);
                     }
                 }
@@ -956,16 +1085,19 @@ public class BattlefieldHandler : IHandler
                 if (!_announcedTooltips.Add(text)) continue;
                 _lastInstructionText = text;
                 _lastTutorialText = text;
-                ScreenReader.SayQueued(text);
+                AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TutorialText: " + text);
             }
 
             if (!_tutorialTextsInitialized && _trackedTutorialTexts.Count > 0)
             {
-                _tutorialInitScanCount++;
-                // Wait for 6 scan cycles (~3 seconds) before considering initialized
+                if (_tutorialInitStartTime == 0f)
+                {
+                    _tutorialInitStartTime = Time.time;
+                }
+                // Wait for 3 seconds before considering initialized
                 // This ensures all pre-loaded tutorial texts are captured silently
-                if (_tutorialInitScanCount >= 6)
+                if (Time.time - _tutorialInitStartTime >= 3.0f)
                 {
                     _tutorialTextsInitialized = true;
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Tutorial texts initialized: {_trackedTutorialTexts.Count} elements tracked");
@@ -1454,14 +1586,25 @@ public class BattlefieldHandler : IHandler
         {
             FocusLocations();
         }
-        // Left/Right: Navigate within current area
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+        // Left/Right: Navigate within current area (hold to repeat)
+        else if (_holdRepeater.Check(SDLInput.Key.Left, () => Navigate(-1))
+            || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
         {
-            Navigate(-1);
+            if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) Navigate(-1);
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+        else if (_holdRepeater.Check(SDLInput.Key.Right, () => Navigate(1))
+            || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
         {
-            Navigate(1);
+            if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) Navigate(1);
+        }
+        // Home/End: jump to first/last item
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Home))
+        {
+            NavigateToIndex(0);
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.End))
+        {
+            NavigateToEnd();
         }
         // Down: Inspect/zoom current item (full details)
         else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
@@ -1488,6 +1631,8 @@ public class BattlefieldHandler : IHandler
             else
             {
                 TryOpenEscapeMenu();
+                // Force a popup scan shortly after opening escape menu so it gets detected
+                _forcePopupScanAfter = Time.time + 0.3f;
             }
         }
         // Space: Advance tutorial
@@ -1510,10 +1655,15 @@ public class BattlefieldHandler : IHandler
         {
             AnnounceEnergy();
         }
-        // T: Turn info (turn number / total)
+        // T: Turn info (turn number / total + cube stake)
         else if (SDLInput.IsKeyDown(SDLInput.Key.T))
         {
             AnnounceTurnInfo();
+        }
+        // W: Timer (time remaining)
+        else if (SDLInput.IsKeyDown(SDLInput.Key.W))
+        {
+            AnnounceTimeRemaining();
         }
         // G: Snap (double the cube stakes)
         else if (SDLInput.IsKeyDown(SDLInput.Key.G))
@@ -1524,6 +1674,29 @@ public class BattlefieldHandler : IHandler
         else if (SDLInput.IsKeyDown(SDLInput.Key.R))
         {
             TryRetreat();
+        }
+        // 1, 2, 3: Quick-play current/selected card to location 1, 2, or 3
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Num1))
+        {
+            QuickPlayToLocation(0);
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Num2))
+        {
+            QuickPlayToLocation(1);
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Num3))
+        {
+            QuickPlayToLocation(2);
+        }
+        // D: Announce drawn cards (deferred from turn start)
+        else if (SDLInput.IsKeyDown(SDLInput.Key.D))
+        {
+            AnnounceStoredDrawnCards();
+        }
+        // S: Silence all speech immediately
+        else if (SDLInput.IsKeyDown(SDLInput.Key.S))
+        {
+            AnnouncementService.Instance.Silence();
         }
         // Debug: F2 dump text, F3 dump tooltips, F4 dump API methods/fields
         else if (Main.DebugMode && SDLInput.IsKeyDown(SDLInput.Key.F2))
@@ -1585,6 +1758,10 @@ public class BattlefieldHandler : IHandler
                     name.Contains("Retreat", StringComparison.OrdinalIgnoreCase) ||
                     name.Contains("Leave", StringComparison.OrdinalIgnoreCase) ||
                     name.Contains("Settings", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("Pause", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("Menu", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("Modal", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("Overlay", StringComparison.OrdinalIgnoreCase) ||
                     name.Contains("GameResult", StringComparison.OrdinalIgnoreCase) ||
                     (name.Contains("Reward", StringComparison.OrdinalIgnoreCase) && _gameOverAnnounced) ||
                     isVfxCanvas)
@@ -1646,29 +1823,40 @@ public class BattlefieldHandler : IHandler
         _popupButtons.AddRange(buttons);
         _popupFocusIndex = 0;
 
-        // Read popup text from parent of first button
+        // Read popup text — walk up from the first button until we find meaningful text
         string popupText = "";
         try
         {
             Transform parent = ((Component)buttons[0]).transform;
-            for (int i = 0; i < 4; i++)
+            // Walk up to 8 parent levels, stopping when we find substantial text
+            for (int i = 0; i < 8; i++)
             {
                 if (parent.parent == null) break;
                 parent = parent.parent;
+                string candidateText = UIHelper.GetAllText(((Component)parent).gameObject);
+                if (!string.IsNullOrEmpty(candidateText) && candidateText.Length > popupText.Length)
+                {
+                    popupText = candidateText;
+                    // Stop if we have a good amount of text (not just button labels)
+                    if (popupText.Length > 50) break;
+                }
             }
-            popupText = UIHelper.GetAllText(((Component)parent).gameObject);
         }
         catch { }
+
+        // Filter popup text to remove cosmetic/junk parts
+        if (!string.IsNullOrEmpty(popupText))
+            popupText = FilterPopupText(popupText);
 
         if (!string.IsNullOrEmpty(popupText) && popupText != _lastPopupText)
         {
             _lastPopupText = popupText;
             if (popupText.Length > 300) popupText = popupText.Substring(0, 300) + "...";
-            ScreenReader.Say(popupText);
+            AnnouncementService.Instance.Announce(popupText, AnnouncementPriority.Normal);
         }
 
         string btnLabel = GetPopupButtonLabel(buttons[0]);
-        ScreenReader.SayQueued(Loc.Get("dialog_button_focus", btnLabel, 1, buttons.Count));
+        AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", btnLabel, 1, buttons.Count), AnnouncementPriority.Normal);
         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Entered popup with {buttons.Count} button(s)");
     }
 
@@ -1684,6 +1872,39 @@ public class BattlefieldHandler : IHandler
         }
     }
 
+    /// <summary>Filters popup text to remove cosmetic junk (card upgrade details, numbers, etc.).</summary>
+    private static string FilterPopupText(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        string[] parts = raw.Split(new[] { ". " }, StringSplitOptions.RemoveEmptyEntries);
+        List<string> filtered = new List<string>();
+        foreach (string part in parts)
+        {
+            string p = part.Trim();
+            if (p.Length < 2) continue;
+            // Skip pure numbers
+            if (int.TryParse(p.Replace(",", ""), out _)) continue;
+            // Skip numeric patterns like "3 / 7", "1 / 10"
+            if (System.Text.RegularExpressions.Regex.IsMatch(p, @"^\d+\s*/\s*\d+$")) continue;
+            // Skip cosmetic/upgrade junk
+            if (p.Equals("Cancel", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Equals("Card Information", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Equals("Equipped Cosmetics", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Equals("Base Card", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Equals("Base Finish", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Equals("No Flare", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.StartsWith("Series ", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Contains("Border", StringComparison.OrdinalIgnoreCase) && p.Length < 30) continue;
+            if (p.Contains("Finish", StringComparison.OrdinalIgnoreCase) && p.Contains("Flare", StringComparison.OrdinalIgnoreCase)) continue;
+            if (System.Text.RegularExpressions.Regex.IsMatch(p, @"^\+\d+$")) continue;
+            if (System.Text.RegularExpressions.Regex.IsMatch(p, @"^\d+/\d+\s*XP$")) continue;
+            if (p.Equals("{Missing Entry}", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Contains("MAX", StringComparison.Ordinal) && p.Length < 5) continue;
+            filtered.Add(p);
+        }
+        return string.Join(". ", filtered);
+    }
+
     private static readonly HashSet<string> _junkPopupLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "Tooltip View Container", "Glass Backing", "Background", "BG",
@@ -1695,25 +1916,32 @@ public class BattlefieldHandler : IHandler
         "Button  Background Close", "Background Button",
     };
 
-    private static readonly Dictionary<string, string> _popupLabelOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    private static Dictionary<string, string> _popupLabelOverrides;
+
+    private static Dictionary<string, string> GetPopupLabelOverrides()
     {
-        { "btn upgrade", "Upgrade" },
-        { "btn_upgrade", "Upgrade" },
-        { "btn_next", "Next" },
-        { "btn_collect", "Collect" },
-        { "btn_claim", "Claim" },
-        { "btn_ok", "OK" },
-        { "btn_confirm", "Confirm" },
-        { "btn_cancel", "Cancel" },
-        { "btn_close", "Close" },
-        { "btn_back", "Back" },
-        { "btn_retreat", "Retreat" },
-        { "btn_stay", "Stay" },
-        { "btn_resume", "Resume" },
-        { "btn_hex_blu", "OK" },
-        { "Button_BackgroundClose", "Close" },
-        { "Esc", "Close" },
-    };
+        if (_popupLabelOverrides != null) return _popupLabelOverrides;
+        _popupLabelOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "btn upgrade", Loc.Get("bf_btn_upgrade") },
+            { "btn_upgrade", Loc.Get("bf_btn_upgrade") },
+            { "btn_next", Loc.Get("bf_btn_next") },
+            { "btn_collect", Loc.Get("bf_btn_collect") },
+            { "btn_claim", Loc.Get("bf_btn_claim") },
+            { "btn_ok", Loc.Get("bf_btn_ok") },
+            { "btn_confirm", Loc.Get("bf_btn_confirm") },
+            { "btn_cancel", Loc.Get("bf_btn_cancel") },
+            { "btn_close", Loc.Get("bf_btn_close") },
+            { "btn_back", Loc.Get("bf_btn_back") },
+            { "btn_retreat", Loc.Get("bf_btn_retreat") },
+            { "btn_stay", Loc.Get("bf_btn_stay") },
+            { "btn_resume", Loc.Get("bf_btn_resume") },
+            { "btn_hex_blu", Loc.Get("bf_btn_ok") },
+            { "Button_BackgroundClose", Loc.Get("bf_btn_close") },
+            { "Esc", Loc.Get("bf_btn_close") },
+        };
+        return _popupLabelOverrides;
+    }
 
     // GO names that should always be filtered from popups
     private static readonly HashSet<string> _junkPopupGoNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -1726,7 +1954,7 @@ public class BattlefieldHandler : IHandler
     private static bool IsJunkPopupButton(string label, string goName)
     {
         // If the GO name has a known override, this is a real button — never filter it
-        if (_popupLabelOverrides.ContainsKey(goName))
+        if (GetPopupLabelOverrides().ContainsKey(goName))
             return false;
 
         if (string.IsNullOrWhiteSpace(label) || _junkPopupLabels.Contains(label))
@@ -1772,7 +2000,7 @@ public class BattlefieldHandler : IHandler
         string goName = ((Object)((Component)btn).gameObject).name;
 
         // Check override by label text first (e.g., "Esc" → "Close")
-        if (_popupLabelOverrides.TryGetValue(label, out string labelOverride))
+        if (GetPopupLabelOverrides().TryGetValue(label, out string labelOverride))
             return labelOverride;
 
         // If the button has real, non-numeric text content (not just a cleaned GO name), prefer it
@@ -1784,7 +2012,7 @@ public class BattlefieldHandler : IHandler
             return label;
 
         // Fall back to GO name override
-        if (_popupLabelOverrides.TryGetValue(goName, out string goOverride))
+        if (GetPopupLabelOverrides().TryGetValue(goName, out string goOverride))
             return goOverride;
 
         return label;
@@ -1806,28 +2034,43 @@ public class BattlefieldHandler : IHandler
         if (_popupButtons.Count == 0) { ExitPopup(); return; }
         if (_popupFocusIndex >= _popupButtons.Count) _popupFocusIndex = 0;
 
-        if (SDLInput.IsKeyDown(SDLInput.Key.Tab) || SDLInput.IsKeyDown(SDLInput.Key.Right))
+        if (SDLInput.IsKeyDown(SDLInput.Key.Tab) || SDLInput.IsKeyDown(SDLInput.Key.Right)
+            || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight) || SDLInput.IsButtonDown(SDLInput.GamepadButton.R1))
         {
             _popupFocusIndex = (_popupFocusIndex + 1) % _popupButtons.Count;
             string label = GetPopupButtonLabel(_popupButtons[_popupFocusIndex]);
-            ScreenReader.Say(Loc.Get("dialog_button_focus", label, _popupFocusIndex + 1, _popupButtons.Count));
+            AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", label, _popupFocusIndex + 1, _popupButtons.Count), AnnouncementPriority.Normal);
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Left))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Left)
+            || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft) || SDLInput.IsButtonDown(SDLInput.GamepadButton.L1))
         {
             _popupFocusIndex = (_popupFocusIndex - 1 + _popupButtons.Count) % _popupButtons.Count;
             string label = GetPopupButtonLabel(_popupButtons[_popupFocusIndex]);
-            ScreenReader.Say(Loc.Get("dialog_button_focus", label, _popupFocusIndex + 1, _popupButtons.Count));
+            AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", label, _popupFocusIndex + 1, _popupButtons.Count), AnnouncementPriority.Normal);
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsKeyDown(SDLInput.Key.Space))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsKeyDown(SDLInput.Key.Space)
+            || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
         {
             if (_popupFocusIndex >= 0 && _popupFocusIndex < _popupButtons.Count)
             {
                 string label = GetPopupButtonLabel(_popupButtons[_popupFocusIndex]);
-                ScreenReader.Say(Loc.Get("dialog_activating", label));
+                AnnouncementService.Instance.Announce(Loc.Get("dialog_activating", label), AnnouncementPriority.Normal);
                 ClickPopupButton(_popupButtons[_popupFocusIndex]);
             }
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Escape))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+        {
+            // Read popup text again
+            if (!string.IsNullOrEmpty(_lastPopupText))
+                AnnouncementService.Instance.Announce(_lastPopupText, AnnouncementPriority.Normal);
+        }
+        else if (_gameOverAnnounced && (SDLInput.IsKeyDown(SDLInput.Key.E) || SDLInput.IsButtonDown(SDLInput.GamepadButton.Start)))
+        {
+            // Game over: E exits the results screen by collecting rewards
+            ExitPopup();
+            TryCollectRewards();
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Escape) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
         {
             // Try to close popup — look for close/cancel/back button
             for (int i = 0; i < _popupButtons.Count; i++)
@@ -1871,7 +2114,7 @@ public class BattlefieldHandler : IHandler
         }
         else
         {
-            ScreenReader.Say(Loc.Get("bf_no_cards"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_cards"), AnnouncementPriority.Normal);
         }
     }
 
@@ -1883,7 +2126,7 @@ public class BattlefieldHandler : IHandler
         if (_playState == PlayState.CardSelected)
         {
             string cardName = GetCardName(_selectedCard);
-            ScreenReader.Say(Loc.Get("bf_choose_location", cardName));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_choose_location", cardName), AnnouncementPriority.Normal);
         }
         if (_locations.Count > 0)
         {
@@ -1891,7 +2134,7 @@ public class BattlefieldHandler : IHandler
         }
         else
         {
-            ScreenReader.Say(Loc.Get("bf_no_locations"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_locations"), AnnouncementPriority.Normal);
         }
     }
 
@@ -1908,13 +2151,45 @@ public class BattlefieldHandler : IHandler
         }
     }
 
+    private void NavigateToIndex(int index)
+    {
+        _detailLevel = 0;
+        switch (_area)
+        {
+            case FocusArea.Hand:
+                if (_handCards.Count == 0) return;
+                UnZoomCurrentCard();
+                _handIndex = Math.Clamp(index, 0, _handCards.Count - 1);
+                AnnounceCurrentCard();
+                break;
+            case FocusArea.Locations:
+                if (_locations.Count == 0) return;
+                _locationIndex = Math.Clamp(index, 0, _locations.Count - 1);
+                AnnounceCurrentLocation();
+                break;
+        }
+    }
+
+    private void NavigateToEnd()
+    {
+        switch (_area)
+        {
+            case FocusArea.Hand:
+                NavigateToIndex(_handCards.Count - 1);
+                break;
+            case FocusArea.Locations:
+                NavigateToIndex(_locations.Count - 1);
+                break;
+        }
+    }
+
     private void NavigateHand(int direction)
     {
         UnZoomCurrentCard();
         _detailLevel = 0;
         if (_handCards.Count == 0)
         {
-            ScreenReader.Say(Loc.Get("bf_no_cards"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_cards"), AnnouncementPriority.Normal);
             return;
         }
         _handIndex += direction;
@@ -1928,7 +2203,7 @@ public class BattlefieldHandler : IHandler
         _detailLevel = 0;
         if (_locations.Count == 0)
         {
-            ScreenReader.Say(Loc.Get("bf_no_locations"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_locations"), AnnouncementPriority.Normal);
             return;
         }
         _locationIndex += direction;
@@ -2025,38 +2300,38 @@ public class BattlefieldHandler : IHandler
                 {
                     CardValueView costView = ((CardRenderer)card)._CostValueView;
                     if ((Object)(object)costView != (Object)null)
-                        ScreenReader.Say($"cost {costView.Value}");
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_detail_cost", costView.Value.ToString()), AnnouncementPriority.Normal);
                     else
-                        ScreenReader.Say("cost unknown");
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_detail_cost_unknown"), AnnouncementPriority.Normal);
                 }
-                catch { ScreenReader.Say("cost unknown"); }
+                catch { AnnouncementService.Instance.Announce(Loc.Get("bf_detail_cost_unknown"), AnnouncementPriority.Normal); }
                 break;
             case 2: // Power
                 try
                 {
                     CardValueView powerView = ((CardRenderer)card)._PowerValueView;
                     if ((Object)(object)powerView != (Object)null)
-                        ScreenReader.Say($"power {powerView.Value}");
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_detail_power", powerView.Value.ToString()), AnnouncementPriority.Normal);
                     else
-                        ScreenReader.Say("power unknown");
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_detail_power_unknown"), AnnouncementPriority.Normal);
                 }
-                catch { ScreenReader.Say("power unknown"); }
+                catch { AnnouncementService.Instance.Announce(Loc.Get("bf_detail_power_unknown"), AnnouncementPriority.Normal); }
                 break;
             case 3: // Ability
                 string ability = GetCardAbilityText(card);
                 if (!string.IsNullOrEmpty(ability))
-                    ScreenReader.Say(ability);
+                    AnnouncementService.Instance.Announce(ability, AnnouncementPriority.Normal);
                 else
-                    ScreenReader.Say("no ability");
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_ability"), AnnouncementPriority.Normal);
                 break;
             default:
                 // Beyond available details — cap at max
                 _detailLevel = 3;
                 string ab = GetCardAbilityText(card);
                 if (!string.IsNullOrEmpty(ab))
-                    ScreenReader.Say(ab);
+                    AnnouncementService.Instance.Announce(ab, AnnouncementPriority.Normal);
                 else
-                    ScreenReader.Say("no ability");
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_ability"), AnnouncementPriority.Normal);
                 break;
         }
     }
@@ -2073,14 +2348,14 @@ public class BattlefieldHandler : IHandler
             case 1: // Description/ability
                 string desc = GetLocationDescription(loc);
                 if (!string.IsNullOrEmpty(desc))
-                    ScreenReader.Say(desc);
+                    AnnouncementService.Instance.Announce(desc, AnnouncementPriority.Normal);
                 else
-                    ScreenReader.Say("no description");
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_description"), AnnouncementPriority.Normal);
                 break;
             case 2: // Power scores
                 string playerPower = GetPowerFromTransform(loc._LocationFriendlyPower);
                 string opponentPower = GetPowerFromTransform(loc._LocationEnemyPower);
-                ScreenReader.Say($"you {playerPower ?? "0"}, opponent {opponentPower ?? "0"}");
+                AnnouncementService.Instance.Announce(Loc.Get("bf_power_score", playerPower ?? "0", opponentPower ?? "0"), AnnouncementPriority.Normal);
                 break;
             case 3: // Cards at this location
                 AnnounceCardsAtLocation(loc);
@@ -2101,7 +2376,7 @@ public class BattlefieldHandler : IHandler
             Il2CppArrayBase<CardView> allCards = Object.FindObjectsOfType<CardView>();
             if (allCards == null || allCards.Count == 0)
             {
-                ScreenReader.Say("no cards here");
+                AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_cards_here"), AnnouncementPriority.Normal);
                 return;
             }
 
@@ -2162,28 +2437,20 @@ public class BattlefieldHandler : IHandler
 
             StringBuilder sb = new StringBuilder();
             if (yourCards.Count > 0)
-            {
-                sb.Append($"Your cards: {string.Join(", ", yourCards)}. ");
-            }
+                sb.Append(Loc.Get("bf_your_cards_at_loc", string.Join(", ", yourCards)) + " ");
             else
-            {
-                sb.Append("No cards from you. ");
-            }
+                sb.Append(Loc.Get("bf_no_your_cards_at_loc") + " ");
             if (opponentCards.Count > 0)
-            {
-                sb.Append($"Opponent cards: {string.Join(", ", opponentCards)}.");
-            }
+                sb.Append(Loc.Get("bf_opponent_cards_at_loc", string.Join(", ", opponentCards)));
             else
-            {
-                sb.Append("No opponent cards.");
-            }
+                sb.Append(Loc.Get("bf_no_opponent_cards_at_loc"));
 
-            ScreenReader.Say(sb.ToString());
+            AnnouncementService.Instance.Announce(sb.ToString(), AnnouncementPriority.Normal);
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "AnnounceCardsAtLocation failed: " + ex.Message);
-            ScreenReader.Say("no cards here");
+            AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_cards_here"), AnnouncementPriority.Normal);
         }
     }
 
@@ -2232,7 +2499,7 @@ public class BattlefieldHandler : IHandler
             string cardName = GetCardName(_selectedCard);
             _selectedCard = null;
             _playState = PlayState.Browsing;
-            ScreenReader.Say(Loc.Get("bf_card_deselected", cardName));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_card_deselected", cardName), AnnouncementPriority.Immediate);
         }
         // If no card selected, do nothing — let the game handle Escape naturally
         // (pause menu, concede dialog, etc.)
@@ -2246,17 +2513,26 @@ public class BattlefieldHandler : IHandler
         if ((Object)(object)card == (Object)null) return;
 
         string cardName = GetCardName(card);
+
+        // Face-down card: click to reveal instead of selecting for play
+        if (cardName == "Unknown card" || cardName == "Card")
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("bf_card_revealing"), AnnouncementPriority.Immediate);
+            UIHelper.SimulateMouseClick(((Component)card).gameObject);
+            DebugLogger.LogInput("Enter", "Revealing face-down card");
+            return;
+        }
         if (_playState == PlayState.CardSelected && (Object)(object)_selectedCard == (Object)(object)card)
         {
             _selectedCard = null;
             _playState = PlayState.Browsing;
-            ScreenReader.Say(Loc.Get("bf_card_deselected", cardName));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_card_deselected", cardName), AnnouncementPriority.Immediate);
         }
         else
         {
             _selectedCard = card;
             _playState = PlayState.CardSelected;
-            ScreenReader.Say(Loc.Get("bf_card_selected", cardName));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_card_selected", cardName), AnnouncementPriority.Immediate);
             DebugLogger.LogInput("Enter", "Selected card: " + cardName);
         }
     }
@@ -2314,7 +2590,7 @@ public class BattlefieldHandler : IHandler
                 {
                     // StartDragCard failed — game doesn't allow dragging this card
                     // This means the tutorial or game rules restrict this card
-                    ScreenReader.Say(Loc.Get("bf_card_restricted", cardName));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_card_restricted", cardName), AnnouncementPriority.Immediate);
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                         $"Card restricted by game: {cardName}");
                     // Announce any active tutorial hints explaining why
@@ -2333,28 +2609,51 @@ public class BattlefieldHandler : IHandler
                 success = TryStageViaControllers(_selectedCard, loc, cardName, locationName);
             }
 
+            // Check if location is full before trying fallbacks
+            if (!success)
+            {
+                int cardCount = CountPlayerCardsAtLocation(_locationIndex);
+                if (cardCount >= 4)
+                {
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_location_full"), AnnouncementPriority.Immediate);
+                    _selectedCard = null;
+                    _playState = PlayState.Browsing;
+                    _area = FocusArea.Hand;
+                    return;
+                }
+            }
+
             // Fallback 2: Mouse drag simulation (physically drag card to location)
             if (!success)
             {
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Trying mouse drag: {cardName} -> {locationName}");
                 SimulateDragCardToLocation(_selectedCard, loc);
-                // Mouse drag is fire-and-forget; assume it worked and let rollback detection catch failures
+                // Mouse drag is fire-and-forget — we'll verify below
                 success = true;
             }
 
             if (success)
             {
-                ScreenReader.Say(Loc.Get("bf_card_played", cardName, locationName));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_card_played", cardName, locationName), AnnouncementPriority.Immediate);
                 // Track for rollback detection
                 try { _lastPlayedEntityId = _selectedCard.EntityId; } catch { }
                 _lastPlayedCardName = cardName;
+                int handBefore = _handCards.Count;
                 ScanHandCards();
                 _handCountAfterPlay = _handCards.Count;
+                _rollbackConfirmStartTime = Time.time;
+                // If hand count didn't change after scan, the play likely failed
+                if (_handCards.Count >= handBefore)
+                {
+                    // Schedule a delayed check — the card might still be animating
+                    _playVerifyTime = Time.time + 1.5f;
+                    _playVerifyExpectedCount = handBefore - 1;
+                }
                 ScanLocations();
             }
             else
             {
-                ScreenReader.Say(Loc.Get("bf_play_failed", cardName, locationName));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_play_failed", cardName, locationName), AnnouncementPriority.Immediate);
                 // Announce tutorial hints explaining why the play failed
                 AnnounceActiveTutorialHints();
             }
@@ -2362,13 +2661,78 @@ public class BattlefieldHandler : IHandler
         catch (Exception ex)
         {
             MelonLogger.Msg("[BF] PlayCardToLocation failed: " + ex.Message);
-            ScreenReader.Say(Loc.Get("bf_play_error"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_play_error"), AnnouncementPriority.Immediate);
             // Ensure drag is cleaned up on error
             try { if ((Object)(object)_gim != (Object)null) _gim.StopDragCard(_selectedCard); } catch { }
         }
         _selectedCard = null;
         _playState = PlayState.Browsing;
         _area = FocusArea.Hand;
+    }
+
+    /// <summary>
+    /// Quick-play: plays the current or selected card directly to the given location index (0, 1, 2).
+    /// If no card is selected, auto-selects the currently focused hand card first.
+    /// Reduces card play from 6-8 key presses to 1-2.
+    /// </summary>
+    // Quick-play two-stage: first press previews location, second press plays
+    private int _quickPlayPreviewIdx = -1;
+    private float _quickPlayPreviewTime = 0f;
+    private const float QuickPlayConfirmTimeout = 3f;
+
+    private void QuickPlayToLocation(int locationIdx)
+    {
+        if (_locations.Count == 0 || locationIdx >= _locations.Count)
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_locations"), AnnouncementPriority.Immediate);
+            return;
+        }
+
+        // Stage 1: Preview — announce location name, power scores
+        if (_quickPlayPreviewIdx != locationIdx || Time.time - _quickPlayPreviewTime > QuickPlayConfirmTimeout)
+        {
+            _quickPlayPreviewIdx = locationIdx;
+            _quickPlayPreviewTime = Time.time;
+
+            LocationView loc = _locations[locationIdx];
+            string locName = GetLocationName(loc);
+            string playerPower = GetPowerFromTransform(loc._LocationFriendlyPower) ?? "0";
+            string opponentPower = GetPowerFromTransform(loc._LocationEnemyPower) ?? "0";
+            int slots = CountPlayerCardsAtLocation(locationIdx);
+
+            string msg = Loc.Get("bf_quickplay_preview", locName, playerPower, opponentPower, slots.ToString());
+            AnnouncementService.Instance.Announce(msg, AnnouncementPriority.High);
+            return;
+        }
+
+        // Stage 2: Confirm — play the card
+        _quickPlayPreviewIdx = -1;
+
+        // If no card selected, auto-select the currently focused hand card
+        if (_playState != PlayState.CardSelected)
+        {
+            if (_area != FocusArea.Hand || _handCards.Count == 0 || _handIndex >= _handCards.Count)
+            {
+                AnnouncementService.Instance.Announce(Loc.Get("bf_no_cards"), AnnouncementPriority.Immediate);
+                return;
+            }
+            CardView card = _handCards[_handIndex];
+            if ((Object)(object)card == (Object)null) return;
+            string name = GetCardName(card);
+            // Face-down card: reveal instead
+            if (name == "Unknown card" || name == "Card")
+            {
+                AnnouncementService.Instance.Announce(Loc.Get("bf_card_revealing"), AnnouncementPriority.Immediate);
+                UIHelper.SimulateMouseClick(((Component)card).gameObject);
+                return;
+            }
+            _selectedCard = card;
+            _playState = PlayState.CardSelected;
+        }
+
+        // Set the target location and delegate to existing play logic
+        _locationIndex = locationIdx;
+        PlayCardToLocation();
     }
 
     private void ForceGameInputFlags()
@@ -2729,7 +3093,7 @@ public class BattlefieldHandler : IHandler
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"TryLeaveGameScene={left}");
                 if (left)
                 {
-                    ScreenReader.Say(Loc.Get("bf_leaving_game"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_leaving_game"), AnnouncementPriority.Immediate);
                     return true;
                 }
             }
@@ -2745,7 +3109,7 @@ public class BattlefieldHandler : IHandler
                     {
                         gvc.OnLeaveGame();
                         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Called GVC.OnLeaveGame");
-                        ScreenReader.Say(Loc.Get("bf_leaving_game"));
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_leaving_game"), AnnouncementPriority.Immediate);
                         return true;
                     }
                 }
@@ -2793,7 +3157,7 @@ public class BattlefieldHandler : IHandler
                         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0u, System.IntPtr.Zero);
                         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0u, System.IntPtr.Zero);
                         _tapToContinueAnnounced = false;
-                        ScreenReader.Say(Loc.Get("bf_tutorial_advance"));
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_tutorial_advance"), AnnouncementPriority.Immediate);
                         DebugLogger.LogInput("Space", "Tutorial click at TapToContinue element");
                         return;
                     }
@@ -2810,15 +3174,19 @@ public class BattlefieldHandler : IHandler
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0u, System.IntPtr.Zero);
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0u, System.IntPtr.Zero);
             _tapToContinueAnnounced = false;
-            ScreenReader.Say(Loc.Get("bf_tutorial_advance"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_tutorial_advance"), AnnouncementPriority.Immediate);
             DebugLogger.LogInput("Space", "Tutorial click at center");
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TryAdvanceTutorial failed: " + ex.Message);
-            ScreenReader.Say(Loc.Get("bf_no_tutorial"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_tutorial"), AnnouncementPriority.Normal);
         }
     }
+
+    // End turn guard: warn if playable cards remain
+    private bool _endTurnGuardPending = false;
+    private float _endTurnGuardTime = 0f;
 
     private void TryEndTurn()
     {
@@ -2828,6 +3196,32 @@ public class BattlefieldHandler : IHandler
             TryCollectRewards();
             return;
         }
+
+        // Phase skip guard: warn if there are playable cards (cost <= available energy)
+        if (!_endTurnGuardPending)
+        {
+            int playableCount = CountPlayableCards();
+            if (playableCount > 0)
+            {
+                _endTurnGuardPending = true;
+                _endTurnGuardTime = Time.time;
+                AnnouncementService.Instance.Announce(Loc.Get("bf_end_turn_guard", playableCount.ToString()), AnnouncementPriority.Immediate);
+                return;
+            }
+        }
+        else
+        {
+            // Guard was pending — if pressed again within 3 seconds, proceed
+            if (Time.time - _endTurnGuardTime > 3f)
+            {
+                // Expired — re-check
+                _endTurnGuardPending = false;
+                TryEndTurn();
+                return;
+            }
+            _endTurnGuardPending = false;
+        }
+
         try
         {
             // Force _WaitStateCanEndTurn=true so tutorial allows ending turns
@@ -2872,19 +3266,19 @@ public class BattlefieldHandler : IHandler
 
             if (clicked || (Object)(object)gameView != (Object)null)
             {
-                ScreenReader.Say(Loc.Get("bf_end_turn"));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_end_turn"), AnnouncementPriority.Immediate);
                 _isPlayerTurn = false;
                 _turnPhaseAnnounced = false;
             }
             else
             {
-                ScreenReader.Say(Loc.Get("bf_no_end_turn"));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_no_end_turn"), AnnouncementPriority.Immediate);
             }
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TryEndTurn failed: " + ex.Message);
-            ScreenReader.Say(Loc.Get("bf_no_end_turn"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_end_turn"), AnnouncementPriority.Immediate);
         }
     }
 
@@ -2899,12 +3293,12 @@ public class BattlefieldHandler : IHandler
             {
                 if (UIHelper.ClickButton(sdBtn))
                 {
-                    ScreenReader.Say(Loc.Get("bf_leaving_game"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_leaving_game"), AnnouncementPriority.Immediate);
                     DebugLogger.LogInput("E", "Collect Rewards / Exit via direct button click");
                 }
                 else
                 {
-                    ScreenReader.Say(Loc.Get("bf_no_end_turn"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_no_end_turn"), AnnouncementPriority.Immediate);
                 }
             }
             else
@@ -2916,17 +3310,17 @@ public class BattlefieldHandler : IHandler
                     Button fallbackBtn = ((Component)endBtn).GetComponentInChildren<Button>(true);
                     if ((Object)(object)fallbackBtn != (Object)null && UIHelper.ClickButton(fallbackBtn))
                     {
-                        ScreenReader.Say(Loc.Get("bf_leaving_game"));
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_leaving_game"), AnnouncementPriority.Immediate);
                         DebugLogger.LogInput("E", "Collect Rewards / Exit via EndTurnButtonView fallback");
                     }
                     else
                     {
-                        ScreenReader.Say(Loc.Get("bf_no_end_turn"));
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_no_end_turn"), AnnouncementPriority.Immediate);
                     }
                 }
                 else
                 {
-                    ScreenReader.Say(Loc.Get("bf_no_end_turn"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_no_end_turn"), AnnouncementPriority.Immediate);
                 }
             }
         }
@@ -2936,13 +3330,139 @@ public class BattlefieldHandler : IHandler
         }
     }
 
+    private float _lastPostGameCheck = 0f;
+    private string _lastPostGameAnnouncement = "";
+
+    /// <summary>Check for post-game upgrade/reward screens and announce them.</summary>
+    private void CheckPostGameScreen()
+    {
+        if (Time.time - _lastPostGameCheck < 2f) return;
+        _lastPostGameCheck = Time.time;
+
+        try
+        {
+            // Check for upgrade animation (VfxUpgradeCardFlow skip button)
+            Il2CppArrayBase<Button> buttons = Object.FindObjectsOfType<Button>();
+            if (buttons == null) return;
+
+            for (int i = 0; i < buttons.Count; i++)
+            {
+                Button btn = buttons[i];
+                if ((Object)(object)btn == (Object)null) continue;
+                if (!((Component)btn).gameObject.activeInHierarchy) continue;
+                string goName = ((Object)((Component)btn).gameObject).name;
+
+                // Detect upgrade skip or continue buttons
+                if (goName.Contains("Skip", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Continue", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Claim", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Collect", StringComparison.OrdinalIgnoreCase))
+                {
+                    string label = UIHelper.GetButtonLabel(btn);
+                    if (string.IsNullOrEmpty(label)) label = goName;
+                    // Filter out pure numeric labels (collection level counters like "33")
+                    // and labels that are just "Level XX" — those are level-up indicators, not actions
+                    string labelTrimmed = label.Trim();
+                    if (int.TryParse(labelTrimmed, out _)) continue;
+                    if (labelTrimmed.StartsWith("Level", StringComparison.OrdinalIgnoreCase)) continue;
+                    // Skip very short labels that aren't meaningful action text
+                    if (labelTrimmed.Length < 3) continue;
+                    string announcement = $"Press Space to {label}";
+                    if (announcement != _lastPostGameAnnouncement)
+                    {
+                        _lastPostGameAnnouncement = announcement;
+                        // Read any visible text on screen (reward info)
+                        string screenText = ReadPostGameText();
+                        if (!string.IsNullOrEmpty(screenText))
+                            AnnouncementService.Instance.Announce(screenText, AnnouncementPriority.Normal);
+                        AnnouncementService.Instance.Announce(announcement, AnnouncementPriority.Low);
+                    }
+                    return;
+                }
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>Read visible text during post-game screens (rewards, upgrade info).</summary>
+    private string ReadPostGameText()
+    {
+        try
+        {
+            // Look for text in EndGameCanvas or Rewards canvas
+            GameObject endGame = GameObject.Find("EndGameCanvas");
+            if (endGame != null && endGame.activeInHierarchy)
+            {
+                string text = UIHelper.GetAllText(endGame);
+                if (!string.IsNullOrEmpty(text) && text.Length > 3)
+                    return text.Length > 300 ? text.Substring(0, 300) : text;
+            }
+
+            GameObject rewards = GameObject.Find("Canvas-Rewards");
+            if (rewards != null && rewards.activeInHierarchy)
+            {
+                string text = UIHelper.GetAllText(rewards);
+                if (!string.IsNullOrEmpty(text) && text.Length > 3)
+                    return text.Length > 300 ? text.Substring(0, 300) : text;
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    /// <summary>Try to skip upgrade animation by clicking skip/continue buttons.</summary>
+    private void TrySkipUpgradeAnimation()
+    {
+        try
+        {
+            Il2CppArrayBase<Button> buttons = Object.FindObjectsOfType<Button>();
+            if (buttons == null) return;
+
+            for (int i = 0; i < buttons.Count; i++)
+            {
+                Button btn = buttons[i];
+                if ((Object)(object)btn == (Object)null) continue;
+                if (!((Component)btn).gameObject.activeInHierarchy) continue;
+                string goName = ((Object)((Component)btn).gameObject).name;
+
+                // Skip btn_collectionscore (shows collection level "36", not actionable)
+                if (goName.Equals("btn_collectionscore", StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (goName.Contains("Skip", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Continue", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Claim", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Collect", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("Next", StringComparison.OrdinalIgnoreCase))
+                {
+                    string label = UIHelper.GetButtonLabel(btn);
+                    // Skip pure numeric labels (collection level counters)
+                    if (!string.IsNullOrEmpty(label) && int.TryParse(label.Trim(), out _)) continue;
+                    if (UIHelper.ClickButtonWithFallback(btn))
+                    {
+                        AnnouncementService.Instance.Announce(label ?? "Skipped", AnnouncementPriority.Normal);
+                        DebugLogger.LogInput("Space", "Post-game skip: " + goName);
+                        _lastPostGameAnnouncement = "";
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: click center of screen to skip (common in animations)
+            UIHelper.SimulateMouseClickAtCenter();
+            AnnouncementService.Instance.Announce("Skipping.", AnnouncementPriority.Normal);
+        }
+        catch { }
+    }
+
     /// <summary>Finds the EndTurnSDButton by searching active buttons.</summary>
     private Button FindEndTurnSDButton()
     {
         try
         {
+            // Try exact name first
             Il2CppArrayBase<Button> buttons = Object.FindObjectsOfType<Button>();
             if (buttons == null) return null;
+            Button fallback = null;
             for (int i = 0; i < buttons.Count; i++)
             {
                 Button btn = buttons[i];
@@ -2951,6 +3471,20 @@ public class BattlefieldHandler : IHandler
                 string goName = ((Object)((Component)btn).gameObject).name;
                 if (goName == "EndTurnSDButton")
                     return btn;
+                // Broader match for renamed/alternate end turn buttons
+                if (goName.Contains("EndTurn", StringComparison.OrdinalIgnoreCase) ||
+                    goName.Contains("End_Turn", StringComparison.OrdinalIgnoreCase))
+                    fallback = btn;
+            }
+            if (fallback != null) return fallback;
+
+            // Last resort: try EndTurnButtonView component
+            EndTurnButtonView endBtnView = UIHelper.FindComponent<EndTurnButtonView>();
+            if ((Object)(object)endBtnView != (Object)null)
+            {
+                Button viewBtn = ((Component)endBtnView).GetComponentInChildren<Button>(true);
+                if ((Object)(object)viewBtn != (Object)null && ((Component)viewBtn).gameObject.activeInHierarchy)
+                    return viewBtn;
             }
         }
         catch (Exception ex)
@@ -2968,6 +3502,13 @@ public class BattlefieldHandler : IHandler
         if ((Object)(object)card == (Object)null) return;
 
         string cardName = GetCardName(card);
+
+        // If we can't read the card name, it might be face-down
+        if (cardName == "Unknown card" || cardName == "Card")
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("bf_card_face_down", _handIndex + 1, _handCards.Count), AnnouncementPriority.Normal);
+            return;
+        }
         string costStr = "";
         try
         {
@@ -2976,10 +3517,23 @@ public class BattlefieldHandler : IHandler
                 costStr = costView.Value.ToString();
         }
         catch { }
-        ScreenReader.Say(Loc.Get("bf_card_brief", cardName, costStr, _handIndex + 1, _handCards.Count));
+        string msg;
+        if (ModSettings.Instance.PositionCounts)
+            msg = Loc.Get("bf_card_brief", cardName, costStr, _handIndex + 1, _handCards.Count);
+        else
+            msg = cardName + (string.IsNullOrEmpty(costStr) ? "" : ", " + Loc.Get("deck_builder_cost", costStr));
+
+        // VerboseCardInfo: append ability text automatically
+        if (ModSettings.Instance.VerboseCardInfo)
+        {
+            string ability = GetCardAbilityText(card);
+            if (!string.IsNullOrEmpty(ability)) msg += ". " + ability;
+        }
+
+        AnnouncementService.Instance.Announce(msg, AnnouncementPriority.Normal);
     }
 
-    /// <summary>Announce location name and position only — down arrow for full details.</summary>
+    /// <summary>Announce location name, position, and card slots — warns if full.</summary>
     private void AnnounceCurrentLocation()
     {
         if (_locations.Count == 0 || _locationIndex >= _locations.Count) return;
@@ -2987,7 +3541,244 @@ public class BattlefieldHandler : IHandler
         if ((Object)(object)loc == (Object)null) return;
 
         string locationName = GetLocationName(loc);
-        ScreenReader.Say(Loc.Get("bf_location_brief", locationName, _locationIndex + 1, _locations.Count));
+        int playerCardCount = CountPlayerCardsAtLocation(_locationIndex);
+
+        // Build restriction prefix when a card is selected
+        string prefix = "";
+        if (_playState == PlayState.CardSelected)
+        {
+            string restriction = GetLocationRestriction(loc, playerCardCount);
+            if (!string.IsNullOrEmpty(restriction))
+                prefix = restriction + ". ";
+        }
+
+        string msg = ModSettings.Instance.PositionCounts
+            ? Loc.Get("bf_location_brief", locationName, _locationIndex + 1, _locations.Count)
+            : locationName;
+
+        // Append power scores
+        try
+        {
+            string playerPower = GetPowerFromTransform(loc._LocationFriendlyPower);
+            string opponentPower = GetPowerFromTransform(loc._LocationEnemyPower);
+            if (!string.IsNullOrEmpty(playerPower) || !string.IsNullOrEmpty(opponentPower))
+                msg += ", " + Loc.Get("bf_power_score", playerPower ?? "0", opponentPower ?? "0");
+        }
+        catch { }
+
+        // Append restriction AFTER location name so name is always read first
+        if (!string.IsNullOrEmpty(prefix))
+            msg += ". " + prefix.TrimEnd(' ', '.');
+
+        // Show slot count when selecting a target
+        if (playerCardCount >= 4)
+        {
+            if (string.IsNullOrEmpty(prefix)) // Don't duplicate "Full" if already in prefix
+                msg += ". " + Loc.Get("bf_location_full");
+        }
+        else if (playerCardCount > 0 && _playState == PlayState.CardSelected)
+            msg += ". " + Loc.Get("bf_slots_used", playerCardCount);
+
+        AnnouncementService.Instance.Announce(msg, AnnouncementPriority.Normal);
+    }
+
+    /// <summary>
+    /// Returns a human-readable restriction reason if the selected card cannot be played
+    /// at this location, or empty string if playable.
+    /// </summary>
+    private string GetLocationRestriction(LocationView loc, int playerCardCount)
+    {
+        // Full location
+        if (playerCardCount >= 4)
+            return Loc.Get("bf_location_full");
+
+        // Not enough energy for selected card
+        if ((Object)(object)_selectedCard != (Object)null)
+        {
+            try
+            {
+                CardValueView costView = ((CardRenderer)_selectedCard)._CostValueView;
+                if ((Object)(object)costView != (Object)null)
+                {
+                    int cardCost = costView.Value;
+                    int currentEnergy = GetCurrentEnergy();
+                    if (currentEnergy >= 0 && cardCost > currentEnergy)
+                        return $"Not enough energy, need {cardCost}, have {currentEnergy}";
+                }
+            }
+            catch { }
+        }
+
+        // Check location description for card-specific restrictions
+        try
+        {
+            string desc = GetLocationDescription(loc);
+            if (string.IsNullOrEmpty(desc))
+            {
+                // Fallback: read "Location Description Text" from location hierarchy
+                Transform locT = ((Component)loc).transform;
+                Il2CppArrayBase<TMP_Text> texts = locT.GetComponentsInChildren<TMP_Text>(true);
+                if (texts != null)
+                {
+                    for (int ti = 0; ti < texts.Count; ti++)
+                    {
+                        TMP_Text tmp = texts[ti];
+                        if ((Object)(object)tmp == (Object)null) continue;
+                        string goName = ((Object)((Component)tmp).gameObject).name;
+                        if (!goName.Contains("Description", StringComparison.OrdinalIgnoreCase)) continue;
+                        string text = UIHelper.StripRichText(tmp.text);
+                        if (!string.IsNullOrEmpty(text) && text.Length > 3 && !text.Contains("{Missing"))
+                        {
+                            desc = text;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!string.IsNullOrEmpty(desc))
+            {
+                string descLower = desc.ToLower();
+                // Common location restriction patterns
+                if (descLower.Contains("can't play") || descLower.Contains("cannot play") ||
+                    descLower.Contains("no cards can") || descLower.Contains("cards can't be") ||
+                    descLower.Contains("can't be played"))
+                {
+                    // Check if it's a cost restriction and whether our card matches
+                    if ((Object)(object)_selectedCard != (Object)null)
+                    {
+                        try
+                        {
+                            CardValueView costView = ((CardRenderer)_selectedCard)._CostValueView;
+                            if ((Object)(object)costView != (Object)null)
+                            {
+                                int cardCost = costView.Value;
+                                // Parse "cost X or less/more" patterns
+                                if (CheckCostRestriction(descLower, cardCost))
+                                    return desc;
+                            }
+                            else
+                            {
+                                return desc;
+                            }
+                        }
+                        catch { return desc; }
+                    }
+                    else
+                    {
+                        return desc;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        return "";
+    }
+
+    /// <summary>Checks if a card cost matches a restriction like "cost X or less can't be played".</summary>
+    private bool CheckCostRestriction(string descLower, int cardCost)
+    {
+        // "cards that cost 3 or less" — extract number and check
+        int idx = descLower.IndexOf("cost ");
+        if (idx >= 0)
+        {
+            idx += 5;
+            string numStr = "";
+            while (idx < descLower.Length && char.IsDigit(descLower[idx]))
+            {
+                numStr += descLower[idx];
+                idx++;
+            }
+            if (int.TryParse(numStr, out int threshold))
+            {
+                if (descLower.Contains("or less") && cardCost <= threshold)
+                    return true;
+                if (descLower.Contains("or more") && cardCost >= threshold)
+                    return true;
+                if (!descLower.Contains("or less") && !descLower.Contains("or more") && cardCost == threshold)
+                    return true;
+            }
+        }
+        // If we can't parse, just show the restriction for safety
+        return true;
+    }
+
+    /// <summary>Returns the current energy value, or -1 if unavailable.</summary>
+    private int GetCurrentEnergy()
+    {
+        try
+        {
+            EnergyView ev = UIHelper.FindComponent<EnergyView>();
+            if ((Object)(object)ev == (Object)null) return -1;
+            string text = UIHelper.GetAllText(((Component)ev).gameObject);
+            if (string.IsNullOrEmpty(text)) return -1;
+            // Energy text is like "3. 6" or "3/6" — first number is current
+            string cleaned = text.Replace("/", ".").Trim();
+            int dotIdx = cleaned.IndexOf('.');
+            if (dotIdx > 0)
+            {
+                string currentStr = cleaned.Substring(0, dotIdx).Trim();
+                if (int.TryParse(currentStr, out int val))
+                    return val;
+            }
+            // Single number
+            if (int.TryParse(cleaned, out int single))
+                return single;
+        }
+        catch { }
+        return -1;
+    }
+
+    /// <summary>Count player cards at a specific location index.</summary>
+    private int CountPlayerCardsAtLocation(int locIdx)
+    {
+        if (locIdx < 0 || locIdx >= _locations.Count) return 0;
+        try
+        {
+            LocationView targetLoc = _locations[locIdx];
+            if ((Object)(object)targetLoc == (Object)null) return 0;
+            float locX = ((Component)targetLoc).transform.position.x;
+
+            Il2CppArrayBase<CardView> allCards = Object.FindObjectsOfType<CardView>();
+            if (allCards == null) return 0;
+
+            int count = 0;
+            for (int i = 0; i < allCards.Count; i++)
+            {
+                CardView cv = allCards[i];
+                if ((Object)(object)cv == (Object)null) continue;
+                if (!((Component)cv).gameObject.activeInHierarchy) continue;
+                if (IsInHandZone(cv)) continue;
+                try { if (IsInObjectPool(cv)) continue; } catch { }
+
+                int entityId;
+                try { entityId = cv.EntityId; } catch { continue; }
+                if (entityId <= 0) continue;
+
+                // Only count our cards
+                if (!_ourCardEntityIds.Contains(entityId)) continue;
+
+                // Check proximity to this location
+                float cardX = ((Component)cv).transform.position.x;
+                int nearestLocIdx = -1;
+                float minDist = float.MaxValue;
+                for (int li = 0; li < _locations.Count; li++)
+                {
+                    LocationView otherLoc = _locations[li];
+                    if ((Object)(object)otherLoc == (Object)null) continue;
+                    float dist = Math.Abs(cardX - ((Component)otherLoc).transform.position.x);
+                    if (dist < minDist)
+                    {
+                        minDist = dist;
+                        nearestLocIdx = li;
+                    }
+                }
+                if (nearestLocIdx == locIdx) count++;
+            }
+            return count;
+        }
+        catch { return 0; }
     }
 
     private void AnnounceGameInfo()
@@ -3004,7 +3795,7 @@ public class BattlefieldHandler : IHandler
         {
             parts.Add(Loc.Get("bf_tutorial_instruction", _lastInstructionText));
         }
-        ScreenReader.Say(string.Join(". ", parts));
+        AnnouncementService.Instance.Announce(string.Join(". ", parts), AnnouncementPriority.Normal);
     }
 
     private void AnnounceEnergy()
@@ -3012,11 +3803,11 @@ public class BattlefieldHandler : IHandler
         string energy = GetEnergyText();
         if (!string.IsNullOrEmpty(energy))
         {
-            ScreenReader.Say($"Energy {energy}");
+            AnnouncementService.Instance.Announce($"Energy {energy}", AnnouncementPriority.Normal);
         }
         else
         {
-            ScreenReader.Say("Energy not available");
+            AnnouncementService.Instance.Announce("Energy not available", AnnouncementPriority.Normal);
         }
     }
 
@@ -3026,7 +3817,7 @@ public class BattlefieldHandler : IHandler
         {
             // Find TurnCountText_Active or TurnCountText_Inactive TMP_Text elements
             Il2CppArrayBase<TMP_Text> texts = Object.FindObjectsOfType<TMP_Text>();
-            if (texts == null) { ScreenReader.Say(Loc.Get("bf_turn_not_available")); return; }
+            if (texts == null) { AnnouncementService.Instance.Announce(Loc.Get("bf_turn_not_available"), AnnouncementPriority.Normal); return; }
 
             string turnText = null;
             for (int i = 0; i < texts.Count; i++)
@@ -3049,28 +3840,146 @@ public class BattlefieldHandler : IHandler
 
             if (!string.IsNullOrEmpty(turnText))
             {
-                // turnText is like "3 / 6" — parse into "Turn 3 of 6"
-                string[] parts = turnText.Split('/');
-                if (parts.Length == 2)
+                string cubeStake = GetCubeStakeValue();
+                string cubeMsg = !string.IsNullOrEmpty(cubeStake) ? " " + Loc.Get("bf_cube_stake", cubeStake) : "";
+
+                if (turnText == "FINAL")
                 {
-                    string current = parts[0].Trim();
-                    string total = parts[1].Trim();
-                    ScreenReader.Say(Loc.Get("bf_turn_info", current, total));
+                    // Final turn — announce with energy and cube stake
+                    string energy = GetEnergyText();
+                    string msg = Loc.Get("bf_final_turn");
+                    if (!string.IsNullOrEmpty(energy)) msg += " Energy " + energy + ".";
+                    msg += cubeMsg;
+                    AnnouncementService.Instance.Announce(msg, AnnouncementPriority.Normal);
                 }
                 else
                 {
-                    ScreenReader.Say(Loc.Get("bf_turn_info_raw", turnText));
+                    // turnText is like "3 / 6" — parse into "Turn 3 of 6"
+                    string[] parts = turnText.Split('/');
+                    if (parts.Length == 2)
+                    {
+                        string current = parts[0].Trim();
+                        string total = parts[1].Trim();
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_turn_info", current, total) + cubeMsg, AnnouncementPriority.Normal);
+                    }
+                    else
+                    {
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_turn_info_raw", turnText) + cubeMsg, AnnouncementPriority.Normal);
+                    }
                 }
             }
             else
             {
-                ScreenReader.Say(Loc.Get("bf_turn_not_available"));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_turn_not_available"), AnnouncementPriority.Normal);
             }
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "AnnounceTurnInfo failed: " + ex.Message);
-            ScreenReader.Say(Loc.Get("bf_turn_not_available"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_turn_not_available"), AnnouncementPriority.Normal);
+        }
+    }
+
+    /// <summary>Count cards in hand that could be played (cost <= available energy).</summary>
+    private int CountPlayableCards()
+    {
+        try
+        {
+            string energyText = GetEnergyText();
+            if (string.IsNullOrEmpty(energyText)) return 0;
+            // Energy text is like "3/6" — we want the first number (available)
+            string[] parts = energyText.Split('/');
+            if (parts.Length == 0) return 0;
+            if (!int.TryParse(parts[0].Trim(), out int available)) return 0;
+            if (available <= 0) return 0;
+
+            int count = 0;
+            for (int i = 0; i < _handCards.Count; i++)
+            {
+                CardView card = _handCards[i];
+                if ((Object)(object)card == (Object)null) continue;
+                try
+                {
+                    CardValueView costView = ((CardRenderer)card)._CostValueView;
+                    if ((Object)(object)costView != (Object)null && costView.Value <= available)
+                        count++;
+                }
+                catch { }
+            }
+            return count;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>Find or cache the TurnTimer component.</summary>
+    private TurnTimer FindTurnTimer()
+    {
+        if ((Object)(object)_turnTimer != (Object)null) return _turnTimer;
+        try { _turnTimer = Object.FindObjectOfType<TurnTimer>(); }
+        catch { }
+        return _turnTimer;
+    }
+
+    /// <summary>Checks TurnTimer component for warning thresholds and announces time running low.</summary>
+    private void CheckTurnTimer()
+    {
+        if (Time.time - _lastTimerCheck < 0.5f) return;
+        _lastTimerCheck = Time.time;
+
+        TurnTimer timer = FindTurnTimer();
+        if ((Object)(object)timer == (Object)null) return;
+
+        try
+        {
+            if (!timer._Active_k__BackingField || timer._noTimer) return;
+            float remaining = timer.GetRemainingTime();
+
+            // Warning at 15 seconds
+            if (!_turnTimerWarningFired && remaining <= 15f && remaining > 0f)
+            {
+                _turnTimerWarningFired = true;
+                int secs = (int)remaining;
+                AnnouncementService.Instance.Announce(Loc.Get("bf_timer_warning", secs.ToString()), AnnouncementPriority.Immediate);
+            }
+            // Urgent at 5 seconds
+            else if (!_turnTimerUrgentFired && remaining <= 5f && remaining > 0f)
+            {
+                _turnTimerUrgentFired = true;
+                int secs = (int)remaining;
+                AnnouncementService.Instance.Announce(Loc.Get("bf_timer_urgent", secs.ToString()), AnnouncementPriority.Critical);
+            }
+
+            // Reset when timer goes back up (new turn started)
+            if (remaining > 20f)
+            {
+                _turnTimerWarningFired = false;
+                _turnTimerUrgentFired = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "CheckTurnTimer failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>W key: announce time remaining from TurnTimer component.</summary>
+    private void AnnounceTimeRemaining()
+    {
+        TurnTimer timer = FindTurnTimer();
+        if ((Object)(object)timer == (Object)null || !timer._Active_k__BackingField || timer._noTimer)
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("bf_timer_not_active"), AnnouncementPriority.Normal);
+            return;
+        }
+        try
+        {
+            float remaining = timer.GetRemainingTime();
+            int secs = (int)remaining;
+            AnnouncementService.Instance.Announce(Loc.Get("bf_timer_remaining", secs.ToString()), AnnouncementPriority.High);
+        }
+        catch
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("bf_timer_not_active"), AnnouncementPriority.Normal);
         }
     }
 
@@ -3079,28 +3988,23 @@ public class BattlefieldHandler : IHandler
     {
         try
         {
-            List<string> parts = new List<string>();
-
-            // Get turn number
             string turnText = GetTurnText();
-            if (!string.IsNullOrEmpty(turnText))
+            string energy = GetEnergyText();
+
+            // Ultra-concise: "Turn 3, energy 3, go." — minimize speech time so user can act fast
+            string msg;
+            if (turnText == "FINAL")
+                msg = Loc.Get("bf_turn_start_final", energy ?? "?");
+            else if (turnText != null && turnText.Contains("/"))
             {
                 string[] split = turnText.Split('/');
-                if (split.Length == 2)
-                    parts.Add(Loc.Get("bf_turn_info", split[0].Trim(), split[1].Trim()));
-                else
-                    parts.Add(Loc.Get("bf_turn_info_raw", turnText));
+                msg = Loc.Get("bf_turn_start", split[0].Trim(), energy ?? "?");
             }
+            else
+                msg = Loc.Get("bf_your_turn");
 
-            // Get energy
-            string energy = GetEnergyText();
-            if (!string.IsNullOrEmpty(energy))
-                parts.Add($"Energy {energy}");
-
-            // Announce "Your turn"
-            parts.Add(Loc.Get("bf_your_turn"));
-
-            ScreenReader.SayQueued(string.Join(". ", parts));
+            // Immediate priority: interrupts any lingering speech so user hears this first
+            AnnouncementService.Instance.Announce(msg, AnnouncementPriority.Immediate);
             _turnPhaseAnnounced = false; // Reset so we can announce "waiting" after they end turn
         }
         catch (Exception ex)
@@ -3109,7 +4013,7 @@ public class BattlefieldHandler : IHandler
         }
     }
 
-    /// <summary>Gets the raw turn text (e.g. "3 / 6") without announcing it.</summary>
+    /// <summary>Gets the raw turn text (e.g. "3 / 6" or "FINAL TURN") without announcing it.</summary>
     private string GetTurnText()
     {
         try
@@ -3125,8 +4029,13 @@ public class BattlefieldHandler : IHandler
                 if (goName.Contains("TurnCountText", StringComparison.OrdinalIgnoreCase))
                 {
                     string val = t.text;
-                    if (!string.IsNullOrEmpty(val) && val.Contains("/"))
-                        return val.Trim();
+                    if (string.IsNullOrEmpty(val)) continue;
+                    val = val.Trim();
+                    // Normal format: "3 / 6"
+                    if (val.Contains("/")) return val;
+                    // Final turn: text says "FINAL TURN" or similar without a slash
+                    if (val.Contains("FINAL", StringComparison.OrdinalIgnoreCase))
+                        return "FINAL";
                 }
             }
         }
@@ -3137,7 +4046,7 @@ public class BattlefieldHandler : IHandler
     /// <summary>Checks end turn button text to detect turn phase and announce changes.</summary>
     private void CheckTurnPhase()
     {
-        if (UnityEngine.Time.time - _lastTurnPhaseCheck < 1.0f) return;
+        if (UnityEngine.Time.time - _lastTurnPhaseCheck < 0.35f) return;
         _lastTurnPhaseCheck = UnityEngine.Time.time;
 
         try
@@ -3166,7 +4075,7 @@ public class BattlefieldHandler : IHandler
                     if (!_turnPhaseAnnounced)
                     {
                         _turnPhaseAnnounced = true;
-                        ScreenReader.SayQueued(Loc.Get("bf_waiting_for_opponent"));
+                        AnnouncementService.Instance.Announce(Loc.Get("bf_waiting_for_opponent"), AnnouncementPriority.Immediate);
                     }
                     return;
                 }
@@ -3194,12 +4103,12 @@ public class BattlefieldHandler : IHandler
                 // Use mouse simulation — onClick.Invoke doesn't trigger the snap mechanic
                 if (SimulateClickOnButton((Component)stakesBtn))
                 {
-                    ScreenReader.Say(Loc.Get("bf_snapped"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_snapped"), AnnouncementPriority.Immediate);
                     DebugLogger.LogInput("G", "Snap via mouse simulation — stakes were " + cubeValue);
                 }
                 else
                 {
-                    ScreenReader.Say(Loc.Get("bf_snap_no_button"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_snap_no_button"), AnnouncementPriority.Normal);
                 }
             }
             else
@@ -3208,18 +4117,18 @@ public class BattlefieldHandler : IHandler
                 string cubeValue = GetCubeStakeValue();
                 if (!string.IsNullOrEmpty(cubeValue))
                 {
-                    ScreenReader.Say(Loc.Get("bf_snap_not_available", cubeValue));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_snap_not_available", cubeValue), AnnouncementPriority.Normal);
                 }
                 else
                 {
-                    ScreenReader.Say(Loc.Get("bf_snap_no_button"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_snap_no_button"), AnnouncementPriority.Normal);
                 }
             }
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TrySnap failed: " + ex.Message);
-            ScreenReader.Say(Loc.Get("bf_snap_no_button"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_snap_no_button"), AnnouncementPriority.Normal);
         }
     }
 
@@ -3231,7 +4140,7 @@ public class BattlefieldHandler : IHandler
             Button retreatBtn = FindButtonByGameObjectName("RetreatSDButton");
             if ((Object)(object)retreatBtn == (Object)null)
             {
-                ScreenReader.Say(Loc.Get("bf_retreat_no_button"));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_retreat_no_button"), AnnouncementPriority.Immediate);
                 return;
             }
 
@@ -3242,7 +4151,7 @@ public class BattlefieldHandler : IHandler
             {
                 _retreatPending = true;
                 _retreatPendingTime = UnityEngine.Time.time;
-                ScreenReader.Say(Loc.Get("bf_retreat_confirm", cubeValue));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_retreat_confirm", cubeValue), AnnouncementPriority.Immediate);
                 DebugLogger.LogInput("R", "Retreat confirmation requested — stakes " + cubeValue);
                 return;
             }
@@ -3251,18 +4160,18 @@ public class BattlefieldHandler : IHandler
             _retreatPending = false;
             if (SimulateClickOnButton((Component)retreatBtn))
             {
-                ScreenReader.Say(Loc.Get("bf_retreat_initiated", cubeValue));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_retreat_initiated", cubeValue), AnnouncementPriority.Critical);
                 DebugLogger.LogInput("R", "Retreat confirmed via mouse simulation — stakes " + cubeValue);
             }
             else
             {
-                ScreenReader.Say(Loc.Get("bf_retreat_no_button"));
+                AnnouncementService.Instance.Announce(Loc.Get("bf_retreat_no_button"), AnnouncementPriority.Immediate);
             }
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TryRetreat failed: " + ex.Message);
-            ScreenReader.Say(Loc.Get("bf_retreat_no_button"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_retreat_no_button"), AnnouncementPriority.Immediate);
         }
     }
 
@@ -3338,6 +4247,7 @@ public class BattlefieldHandler : IHandler
     /// <summary>Scan visible tutorial/tooltip texts and announce contextual hints (not generic teaching).</summary>
     private void AnnounceActiveTutorialHints()
     {
+        if (!ModSettings.Instance.TutorialMessages) return;
         try
         {
             List<string> hints = new List<string>();
@@ -3374,7 +4284,7 @@ public class BattlefieldHandler : IHandler
                     sb.Append(hints[i]);
                 }
                 string combined = Loc.Get("bf_tutorial_hints", sb.ToString());
-                ScreenReader.SayQueued(combined);
+                AnnouncementService.Instance.Announce(combined, AnnouncementPriority.Low);
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                     $"Tutorial hints announced: {maxHints} of {hints.Count}");
             }
@@ -3389,11 +4299,11 @@ public class BattlefieldHandler : IHandler
     {
         if (!string.IsNullOrEmpty(_lastInstructionText))
         {
-            ScreenReader.Say(_lastInstructionText);
+            AnnouncementService.Instance.Announce(_lastInstructionText, AnnouncementPriority.Normal);
         }
         else
         {
-            ScreenReader.Say(Loc.Get("bf_no_tutorial"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_no_tutorial"), AnnouncementPriority.Normal);
         }
     }
 
@@ -3405,7 +4315,7 @@ public class BattlefieldHandler : IHandler
         SetupHarmonyPatches();
         SetupStepMapHooks();
         DebugLogger.Log(LogCategory.State, "BattlefieldHandler", "Game entered");
-        AccessStateManager.TryEnter(AccessStateManager.State.Gameplay);
+        // AccessStateManager removed — state is now tracked by NavigatorManager
         _area = FocusArea.Hand;
         _playState = PlayState.Browsing;
         _handIndex = 0;
@@ -3423,12 +4333,12 @@ public class BattlefieldHandler : IHandler
         string playerName = ReadPlayerName();
         if (!string.IsNullOrEmpty(opponentName))
         {
-            ScreenReader.Say(Loc.Get("bf_game_entered_vs", opponentName));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_game_entered_vs", opponentName), AnnouncementPriority.High);
             _opponentNameAnnounced = true;
         }
         else
         {
-            ScreenReader.Say(Loc.Get("bf_game_entered"));
+            AnnouncementService.Instance.Announce(Loc.Get("bf_game_entered"), AnnouncementPriority.High);
         }
         if (!string.IsNullOrEmpty(playerName))
         {
@@ -3514,8 +4424,8 @@ public class BattlefieldHandler : IHandler
                     _gameOverAnnounced = true;
                     // Read the game result from location scores
                     string result = ReadGameResult();
-                    ScreenReader.Say(Loc.Get("bf_game_over", result));
-                    ScreenReader.SayQueued(Loc.Get("bf_game_over_instructions"));
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_game_over", result), AnnouncementPriority.Critical);
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_game_over_instructions"), AnnouncementPriority.Immediate);
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Game over detected: " + text + " Result: " + result);
                     return;
                 }
@@ -3527,11 +4437,12 @@ public class BattlefieldHandler : IHandler
         }
     }
 
-    /// <summary>Reads location scores to determine win/lose/draw.</summary>
+    /// <summary>Reads location scores to determine win/lose/draw with detailed breakdown.</summary>
     private string ReadGameResult()
     {
         int playerWins = 0;
         int opponentWins = 0;
+        List<string> locationResults = new List<string>();
         try
         {
             if (_locations == null || _locations.Count == 0) return "";
@@ -3546,10 +4457,13 @@ public class BattlefieldHandler : IHandler
                     if ((Object)(object)fp == (Object)null || (Object)(object)ep == (Object)null) continue;
                     string fpText = UIHelper.GetTextInChildren(((Component)fp).gameObject);
                     string epText = UIHelper.GetTextInChildren(((Component)ep).gameObject);
+                    string locName = GetLocationName(loc);
                     if (int.TryParse(fpText, out int fpVal) && int.TryParse(epText, out int epVal))
                     {
                         if (fpVal > epVal) playerWins++;
                         else if (epVal > fpVal) opponentWins++;
+                        if (!string.IsNullOrEmpty(locName))
+                            locationResults.Add(Loc.Get("bf_result_location", locName, fpVal.ToString(), epVal.ToString()));
                     }
                 }
                 catch { }
@@ -3557,15 +4471,27 @@ public class BattlefieldHandler : IHandler
         }
         catch { }
 
-        if (playerWins > opponentWins) return Loc.Get("bf_result_win");
-        if (opponentWins > playerWins) return Loc.Get("bf_result_lose");
-        return Loc.Get("bf_result_draw");
+        string outcome;
+        if (playerWins > opponentWins) outcome = Loc.Get("bf_result_win");
+        else if (opponentWins > playerWins) outcome = Loc.Get("bf_result_lose");
+        else outcome = Loc.Get("bf_result_draw");
+
+        // Include cube stake
+        string cubeStake = GetCubeStakeValue();
+        if (!string.IsNullOrEmpty(cubeStake))
+            outcome += " " + Loc.Get("bf_result_cubes", cubeStake);
+
+        // Include per-location breakdown
+        if (locationResults.Count > 0)
+            outcome += " " + string.Join(". ", locationResults);
+
+        return outcome;
     }
 
     private void OnGameLeft()
     {
         DebugLogger.Log(LogCategory.State, "BattlefieldHandler", "Game left");
-        AccessStateManager.Exit(AccessStateManager.State.Gameplay);
+        // AccessStateManager removed — state is now tracked by NavigatorManager
         _handZone = null;
         _handCards.Clear();
         _locations.Clear();
@@ -3578,7 +4504,7 @@ public class BattlefieldHandler : IHandler
         _lastHandCount = -1;
         _tapToContinueAnnounced = false;
         _tutorialTextsInitialized = false;
-        _tutorialInitScanCount = 0;
+        _tutorialInitStartTime = 0f;
 
         _knownBoardCardEntityIds.Clear();
         _ourCardEntityIds.Clear();
@@ -3586,7 +4512,9 @@ public class BattlefieldHandler : IHandler
         _lastPlayedCardName = null;
         _lastPlayedEntityId = -1;
         _handCountAfterPlay = -1;
-        _rollbackConfirmCycles = 0;
+        _rollbackConfirmStartTime = 0f;
+        _playVerifyTime = 0f;
+        _playVerifyExpectedCount = -1;
         _gameReadyForOpponentDetection = false;
         _turnChangeCount = 0;
         _opponentNameAnnounced = false;
@@ -3688,22 +4616,29 @@ public class BattlefieldHandler : IHandler
     {
         if ((Object)(object)card == (Object)null) return "";
 
-        // Try 1: Direct access to CardRenderer._AbilityText (TMP_Text field, like _CostValueView/_PowerValueView)
+        // Try 1: Find "Ability Text" TMP_Text under AbilityTextRoot/CardAbilityText hierarchy
+        // This is the game's standard path for ability text display
         try
         {
-            CardRenderer renderer = (CardRenderer)card;
-            TMP_Text abilityTmp = renderer._AbilityText;
-            if ((Object)(object)abilityTmp != (Object)null)
+            Transform cardTransform = ((Component)card).transform;
+            // Search for AbilityTextRoot first, then find "Ability Text" inside it
+            Transform abilityRoot = UIHelper.FindChildByName(cardTransform, "AbilityTextRoot")
+                ?? UIHelper.FindChildByName(cardTransform, "CardAbilityText");
+            if ((Object)(object)abilityRoot != (Object)null)
             {
-                string raw = abilityTmp.text;
-                if (!string.IsNullOrWhiteSpace(raw) && !raw.Contains("Missing Entry"))
+                Il2CppArrayBase<TMP_Text> abilityTexts = ((Component)abilityRoot).GetComponentsInChildren<TMP_Text>(true);
+                if (abilityTexts != null)
                 {
-                    if (!IsFlavorText(raw))
+                    for (int i = 0; i < abilityTexts.Count; i++)
                     {
-                        string cleaned = UIHelper.StripRichText(raw.Trim());
+                        TMP_Text tmp = abilityTexts[i];
+                        if ((Object)(object)tmp == (Object)null) continue;
+                        string text = tmp.text;
+                        if (string.IsNullOrWhiteSpace(text) || text.Contains("Missing Entry")) continue;
+                        string cleaned = UIHelper.StripRichText(text.Trim());
                         if (cleaned.Length > 3)
                         {
-                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Card ability from _AbilityText: {cleaned}");
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Card ability from AbilityTextRoot: {cleaned}");
                             return cleaned;
                         }
                     }
@@ -3712,10 +4647,10 @@ public class BattlefieldHandler : IHandler
         }
         catch (Exception ex)
         {
-            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"_AbilityText access failed: {ex.Message}");
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"AbilityTextRoot search failed: {ex.Message}");
         }
 
-        // Try 2: Search child TMP_Text named "Ability Text" under CardAbilityText hierarchy
+        // Try 2: Search all child TMP_Text for any named "Ability Text"
         try
         {
             Il2CppArrayBase<TMP_Text> texts = ((Component)card).GetComponentsInChildren<TMP_Text>(true);
@@ -3727,7 +4662,6 @@ public class BattlefieldHandler : IHandler
                     TMP_Text tmp = texts[i];
                     if ((Object)(object)tmp == (Object)null) continue;
                     string goName = ((Object)((Component)tmp).gameObject).name;
-                    // Prefer "Ability Text" GO specifically
                     if (!goName.Contains("Ability", StringComparison.OrdinalIgnoreCase)) continue;
                     string text = tmp.text;
                     if (string.IsNullOrWhiteSpace(text) || text.Contains("Missing Entry")) continue;
@@ -3739,20 +4673,30 @@ public class BattlefieldHandler : IHandler
                         return cleaned;
                     }
                 }
-                // Fallback: any non-trivial child text that isn't cost/power/name
-                for (int i = 0; i < texts.Count; i++)
+            }
+        }
+        catch { }
+
+        // Try 3: Call UpdateAbilityText() on CardView to force localization, then retry
+        try
+        {
+            card.UpdateAbilityText();
+            Transform cardTransform = ((Component)card).transform;
+            Transform abilityRoot = UIHelper.FindChildByName(cardTransform, "AbilityTextRoot");
+            if ((Object)(object)abilityRoot != (Object)null)
+            {
+                Il2CppArrayBase<TMP_Text> abilityTexts = ((Component)abilityRoot).GetComponentsInChildren<TMP_Text>(true);
+                if (abilityTexts != null)
                 {
-                    TMP_Text tmp = texts[i];
-                    if ((Object)(object)tmp == (Object)null) continue;
-                    if (!((Component)tmp).gameObject.activeInHierarchy) continue;
-                    string text = tmp.text;
-                    if (string.IsNullOrWhiteSpace(text) || text.Contains("Missing Entry")) continue;
-                    if (IsFlavorText(text)) continue;
-                    string cleaned = UIHelper.StripRichText(text.Trim());
-                    if (cleaned.Length < 5) continue;
-                    if (cleaned == cardName) continue;
-                    if (int.TryParse(cleaned, out _)) continue;
-                    return cleaned;
+                    for (int i = 0; i < abilityTexts.Count; i++)
+                    {
+                        TMP_Text tmp = abilityTexts[i];
+                        if ((Object)(object)tmp == (Object)null) continue;
+                        string text = tmp.text;
+                        if (string.IsNullOrWhiteSpace(text) || text.Contains("Missing Entry")) continue;
+                        string cleaned = UIHelper.StripRichText(text.Trim());
+                        if (cleaned.Length > 3) return cleaned;
+                    }
                 }
             }
         }
@@ -3995,7 +4939,7 @@ public class BattlefieldHandler : IHandler
                 count++;
             }
             MelonLogger.Msg($"[DUMP] Total: {count} text objects");
-            ScreenReader.Say($"Dumped {count} text objects to log");
+            AnnouncementService.Instance.Announce($"Dumped {count} text objects to log", AnnouncementPriority.Normal);
         }
         catch (Exception ex)
         {
@@ -4008,7 +4952,7 @@ public class BattlefieldHandler : IHandler
         try
         {
             MelonLogger.Msg("=== API REFLECTION DUMP (F4) ===");
-            ScreenReader.Say("Dumping API reflection to log");
+            AnnouncementService.Instance.Announce("Dumping API reflection to log", AnnouncementPriority.Normal);
 
             // Dump GameInputManager
             DumpTypeInfo(typeof(GameInputManager), "GameInputManager", _gim);
@@ -4056,12 +5000,12 @@ public class BattlefieldHandler : IHandler
             }
 
             MelonLogger.Msg("=== END API REFLECTION DUMP ===");
-            ScreenReader.Say("API dump complete. Check log.");
+            AnnouncementService.Instance.Announce("API dump complete. Check log.", AnnouncementPriority.Normal);
         }
         catch (Exception ex)
         {
             MelonLogger.Msg("[API] DumpApiReflection failed: " + ex.Message);
-            ScreenReader.Say("API dump failed");
+            AnnouncementService.Instance.Announce("API dump failed", AnnouncementPriority.Normal);
         }
     }
 
@@ -4206,7 +5150,7 @@ public class BattlefieldHandler : IHandler
                 count++;
             }
             MelonLogger.Msg($"[TIP] Total: {count} tooltip texts");
-            ScreenReader.Say($"Dumped {count} tooltip diagnostics to log");
+            AnnouncementService.Instance.Announce($"Dumped {count} tooltip diagnostics to log", AnnouncementPriority.Normal);
         }
         catch (Exception ex)
         {

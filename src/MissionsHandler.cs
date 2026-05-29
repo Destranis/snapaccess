@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppTMPro;
@@ -11,7 +11,7 @@ namespace SnapAccess;
 /// <summary>
 /// Specialized handler for the Missions screen.
 /// </summary>
-public class MissionsHandler : IHandler
+public class MissionsHandler : IScreenNavigator
 {
     private class MissionInfo
     {
@@ -34,33 +34,35 @@ public class MissionsHandler : IHandler
     private int _missionIndex = 0;
     private int _menuLevel = 0; // 0=Categories, 1=Missions
     private bool _isActive = false;
-    private bool _activated = false;
+    private bool _activated = false; // Gate: only scan when explicitly activated by MainMenuHandler
     private float _lastScanTime = 0f;
+    private readonly KeyHoldRepeater _holdRepeater = new KeyHoldRepeater();
 
-    public bool IsActive => _isActive && _activated;
+    public string NavigatorId => "Missions";
+    public int Priority => 600;
+    public bool IsActive => _isActive;
 
-    /// <summary>Explicitly activate this handler (called from MainMenuHandler).</summary>
+    /// <summary>
+    /// Called by MainMenuHandler when user navigates to the Missions category.
+    /// Without this gate, MissionsSection GameObjects (always present on play screen)
+    /// would cause this navigator to preempt MainMenuHandler permanently.
+    /// </summary>
     public void Activate()
     {
         _activated = true;
-        _lastScanTime = 0f;
-        _menuLevel = 0;
-        _catIndex = 0;
+        _lastScanTime = 0f; // Force immediate scan
     }
 
-    public bool Update()
+    public void Update()
     {
-        if (!_activated) return false;
-
-        if (!ScanMissions())
+        if (!_activated || !ScanMissions())
         {
             _isActive = false;
-            return false;
+            return;
         }
 
         _isActive = true;
         ProcessInput();
-        return true;
     }
 
     private bool ScanMissions()
@@ -144,11 +146,27 @@ public class MissionsHandler : IHandler
 
     private void ProcessInput()
     {
-        if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MovePrev();
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveNext();
+        if (_holdRepeater.Check(SDLInput.Key.Left, MovePrev)) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MovePrev();
+        else if (_holdRepeater.Check(SDLInput.Key.Right, MoveNext)) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveNext();
         else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown)) ReadDetails();
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Home)) JumpToFirst();
+        else if (SDLInput.IsKeyDown(SDLInput.Key.End)) JumpToLast();
         else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South)) Enter();
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape)) Back();
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East)) Back();
+    }
+
+    private void JumpToFirst()
+    {
+        if (_menuLevel == 0) { _catIndex = 0; AnnounceCat(); }
+        else if (_categories[_catIndex].Missions.Count > 0) { _missionIndex = 0; AnnounceMissionTitle(); }
+    }
+
+    private void JumpToLast()
+    {
+        if (_menuLevel == 0 && _categories.Count > 0) { _catIndex = _categories.Count - 1; AnnounceCat(); }
+        else if (_categories[_catIndex].Missions.Count > 0) { _missionIndex = _categories[_catIndex].Missions.Count - 1; AnnounceMissionTitle(); }
     }
 
     private void MovePrev()
@@ -168,7 +186,7 @@ public class MissionsHandler : IHandler
         if (_menuLevel == 0)
         {
             if (_catIndex >= 0 && _catIndex < _categories.Count)
-                ScreenReader.Say(_categories[_catIndex].Missions.Count + " missions in this category.");
+                AnnouncementService.Instance.Announce(Loc.Get("ms_category_count", _categories[_catIndex].Missions.Count.ToString()));
         }
         else
         {
@@ -183,33 +201,65 @@ public class MissionsHandler : IHandler
         else
         {
             var m = _categories[_catIndex].Missions[_missionIndex];
-            ScreenReader.Say("Claiming mission...");
-            UIHelper.ClickButton(m.ClaimButton);
+            bool isComplete = false;
+            try
+            {
+                isComplete = !string.IsNullOrEmpty(m.Progress) && !string.IsNullOrEmpty(m.Goal) && m.Progress == m.Goal;
+            }
+            catch { }
+            if (isComplete)
+                AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("ms_claiming", m.Title));
+            else
+                AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("ms_opening", m.Title));
+            UIHelper.ClickButtonWithFallback(m.ClaimButton);
+            // Deactivate so DialogHandler can handle any popup that appears
+            _isActive = false;
         }
     }
 
     private void Back()
     {
         if (_menuLevel == 1) { _menuLevel = 0; AnnounceCat(); }
-        else { _isActive = false; _activated = false; }
+        else { _activated = false; _isActive = false; }
     }
 
-    private void AnnounceCat() => ScreenReader.Say(_categories[_catIndex].Name + ", " + _categories[_catIndex].Missions.Count + " missions.");
+    private void AnnounceCat() => AnnouncementService.Instance.Announce(_categories[_catIndex].Name + ", " + _categories[_catIndex].Missions.Count + " missions.");
 
     /// <summary>Short announcement when navigating missions with Left/Right.</summary>
     private void AnnounceMissionTitle()
     {
         var m = _categories[_catIndex].Missions[_missionIndex];
-        ScreenReader.Say(m.Title + ", " + (_missionIndex + 1) + " of " + _categories[_catIndex].Missions.Count);
+        AnnouncementService.Instance.Announce(m.Title + ", " + (_missionIndex + 1) + " of " + _categories[_catIndex].Missions.Count);
     }
 
     /// <summary>Full details when pressing Down.</summary>
     private void AnnounceMission()
     {
         var m = _categories[_catIndex].Missions[_missionIndex];
-        ScreenReader.Say(m.Title + ". " + m.Desc + ". Progress " + m.Progress + " of " + m.Goal + ". Reward: " + m.Reward);
+        AnnouncementService.Instance.Announce(m.Title + ". " + m.Desc + ". Progress " + m.Progress + " of " + m.Goal + ". Reward: " + m.Reward);
     }
 
-    public void AnnounceContext() => AnnounceMission();
-    public void Reset() { _isActive = false; _activated = false; _menuLevel = 0; }
+    public void AnnounceContext()
+    {
+        AnnouncementService.Instance.Announce(Loc.Get("ms_help"), AnnouncementPriority.High);
+        AnnounceCat();
+    }
+
+    public void Deactivate()
+    {
+        _isActive = false;
+        _activated = false;
+        _holdRepeater.Reset();
+    }
+
+    public void OnSceneChanged(string sceneName)
+    {
+        _isActive = false;
+        _activated = false;
+        _menuLevel = 0;
+        _categories.Clear();
+        _catIndex = 0;
+        _missionIndex = 0;
+        _lastScanTime = 0f;
+    }
 }

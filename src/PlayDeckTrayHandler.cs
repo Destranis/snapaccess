@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -12,7 +12,7 @@ namespace SnapAccess;
 /// <summary>
 /// Specialized handler for the Play Deck Tray (Quick Switcher).
 /// </summary>
-public class PlayDeckTrayHandler : IHandler
+public class PlayDeckTrayHandler : IScreenNavigator
 {
     private class TrayDeck
     {
@@ -27,20 +27,22 @@ public class PlayDeckTrayHandler : IHandler
     private Button _closeButton;
     private bool _isActive = false;
     private float _lastScanTime = 0f;
+    private readonly KeyHoldRepeater _holdRepeater = new KeyHoldRepeater();
 
+    public string NavigatorId => "PlayDeckTray";
+    public int Priority => 700;
     public bool IsActive => _isActive;
 
-    public bool Update()
+    public void Update()
     {
         if (!ScanForTray())
         {
             _isActive = false;
-            return false;
+            return;
         }
 
         _isActive = true;
         ProcessInput();
-        return true;
     }
 
     private bool ScanForTray()
@@ -99,25 +101,29 @@ public class PlayDeckTrayHandler : IHandler
 
     private void ProcessInput()
     {
-        if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-        {
-            MoveFocus(-1);
-        }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-        {
-            MoveFocus(1);
-        }
+        if (_holdRepeater.Check(SDLInput.Key.Left, () => MoveFocus(-1))) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MoveFocus(-1);
+        else if (_holdRepeater.Check(SDLInput.Key.Right, () => MoveFocus(1))) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveFocus(1);
         else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
         {
             // Read deck details
             if (_focusIndex >= 0 && _focusIndex < _decks.Count)
-                ScreenReader.Say("Deck: " + _decks[_focusIndex].Name + ". Enter to select and equip, E to edit.");
+                AnnouncementService.Instance.Announce(Loc.Get("pdt_deck_info", _decks[_focusIndex].Name));
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Home))
+        {
+            if (_decks.Count > 0) { _focusIndex = 0; AnnounceDeck(); }
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.End))
+        {
+            if (_decks.Count > 0) { _focusIndex = _decks.Count - 1; AnnounceDeck(); }
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
         {
             ActivateFocused();
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.E))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.E) || SDLInput.IsButtonDown(SDLInput.GamepadButton.West))
         {
             EditFocusedDeck();
         }
@@ -141,20 +147,20 @@ public class PlayDeckTrayHandler : IHandler
         string name = _decks[_focusIndex].Name;
         if (string.IsNullOrEmpty(name) || name == "Deck Slot Cell" || name == "DeckSlotCell")
             name = "Empty Deck Slot";
-        ScreenReader.Say("Deck: " + name + ", " + (_focusIndex + 1) + " of " + _decks.Count);
+        AnnouncementService.Instance.Announce(Loc.Get("pdt_deck_info", name) + ", " + (_focusIndex + 1) + " " + Loc.Get("log_of") + " " + _decks.Count);
     }
 
     private void ActivateFocused()
     {
         if (_focusIndex < 0 || _focusIndex >= _decks.Count) return;
-        
-        ScreenReader.Say("Selecting " + _decks[_focusIndex].Name);
+
+        AnnouncementService.Instance.AnnounceInterrupt("Selecting " + _decks[_focusIndex].Name);
         UIHelper.ClickButton(_decks[_focusIndex].Button);
-        
+
         // After selecting, we almost always want to Equip
         if (_equipButton != null && _equipButton.gameObject.activeInHierarchy)
         {
-            ScreenReader.SayQueued("Equipping...");
+            AnnouncementService.Instance.Announce("Equipping...", AnnouncementPriority.Low);
             UIHelper.ClickButton(_equipButton);
             Close();
         }
@@ -170,12 +176,12 @@ public class PlayDeckTrayHandler : IHandler
 
         if (_editButton != null && _editButton.gameObject.activeInHierarchy)
         {
-            ScreenReader.Say("Editing " + (_focusIndex >= 0 && _focusIndex < _decks.Count ? _decks[_focusIndex].Name : "deck"));
+            AnnouncementService.Instance.AnnounceInterrupt("Editing " + (_focusIndex >= 0 && _focusIndex < _decks.Count ? _decks[_focusIndex].Name : "deck"));
             UIHelper.ClickButton(_editButton);
         }
         else
         {
-            ScreenReader.Say("Edit button not available.");
+            AnnouncementService.Instance.Announce("Edit button not available.");
         }
     }
 
@@ -188,11 +194,19 @@ public class PlayDeckTrayHandler : IHandler
 
     public void AnnounceContext()
     {
-        ScreenReader.Say("Deck Selection Tray. " + _decks.Count + " decks available. Enter to select, E to edit.");
-        AnnounceDeck();
+        AnnouncementService.Instance.Announce(Loc.Get("pdt_help", _decks.Count.ToString()), AnnouncementPriority.High);
+        if (_focusIndex >= 0 && _focusIndex < _decks.Count)
+            AnnounceDeck();
     }
 
-    public void Reset()
+    public void Deactivate()
+    {
+        _isActive = false;
+        _focusIndex = 0;
+        _holdRepeater.Reset();
+    }
+
+    public void OnSceneChanged(string sceneName)
     {
         _isActive = false;
         _decks.Clear();

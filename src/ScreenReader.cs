@@ -79,6 +79,21 @@ public static class ScreenReader
         Say(text, false);
     }
 
+    /// <summary>Stop all current speech output.</summary>
+    public static void Silence()
+    {
+        if (_available)
+        {
+            try
+            {
+                Tolk_Output("", true);
+            }
+            catch
+            {
+            }
+        }
+    }
+
 	public static void Shutdown()
 	{
 		if (_initialized)

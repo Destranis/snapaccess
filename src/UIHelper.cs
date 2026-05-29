@@ -268,6 +268,23 @@ public static class UIHelper
         }
     }
 
+    /// <summary>Simulate a mouse click at the center of the game window.</summary>
+    public static void SimulateMouseClickAtCenter()
+    {
+        try
+        {
+            int cx = Screen.width / 2;
+            int cy = Screen.height / 2;
+            System.IntPtr hwnd = GetForegroundWindow();
+            POINT pt = new POINT { X = cx, Y = cy };
+            ClientToScreen(hwnd, ref pt);
+            SetCursorPos(pt.X, pt.Y);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0u, System.IntPtr.Zero);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0u, System.IntPtr.Zero);
+        }
+        catch { }
+    }
+
     private struct POINT { public int X; public int Y; }
     private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     private const uint MOUSEEVENTF_LEFTUP = 0x0004;

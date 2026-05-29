@@ -19,7 +19,7 @@ namespace SnapAccess;
 /// Handles UI button navigation on menu sub-screens.
 /// Implements a category-based scan for structured browsing when possible.
 /// </summary>
-public class DialogHandler : IHandler
+public class DialogHandler : IScreenNavigator
 {
     private enum ContentCategory
     {
@@ -35,6 +35,7 @@ public class DialogHandler : IHandler
 	private int _focusIndex = -1;
 	private int _textReadIndex = -1;
 	private bool _scanned = false;
+	private readonly KeyHoldRepeater _holdRepeater = new KeyHoldRepeater();
 	private bool _needsRescan = false;
 	private float _rescanDelay = 0f;
 	private float _inputBlockUntil = 0f; // Block input briefly after reset to prevent double-activation
@@ -70,7 +71,7 @@ public class DialogHandler : IHandler
 	private static readonly string[] _excludeParents = new string[]
 	{
 		"Navigator", "NavBar", "Canvas-Game",
-		"Canvas-Gameplay", "LoadingScreen",
+		"Canvas-Gameplay", "Canvas-DevConsole", "LoadingScreen",
 		"CardDetailsCardView", "CardDetail",
 		"AlbumCardView", "CardPreview",
 		"CarouselStagingArea",
@@ -144,9 +145,12 @@ public class DialogHandler : IHandler
 		{ "SmartDeckAutofillButton", "Auto-fill Deck" },
 	};
 
+	public string NavigatorId => "Dialog";
+	public int Priority => 200;
+	public bool IsActive => _buttons.Count > 0 || _settingsMode;
 	public bool HasActiveDialog => _buttons.Count > 0 || _settingsMode;
 
-	public bool Update()
+	public void Update()
 	{
 		// Delayed rescan after clicking a button
 		if (_needsRescan && Time.time >= _rescanDelay)
@@ -166,41 +170,41 @@ public class DialogHandler : IHandler
 		if (_textInputMode)
 		{
 			ProcessTextInput();
-			return true;
+			return;
 		}
 
 		if (_settingsMode)
 		{
-			if (_settingsItems.Count == 0) return false;
+			if (_settingsItems.Count == 0) return;
 			ProcessSettingsInput();
-			return true;
+			return;
 		}
 
 		if (_buttons.Count == 0)
 		{
-			return false;
+			return;
 		}
 		ProcessInput();
-		return true;
 	}
 
 	public void AnnounceContext()
 	{
+		AnnouncementService.Instance.Announce(Loc.Get("dialog_help"), AnnouncementPriority.High);
 		if (_buttons.Count == 0)
 		{
-			ScreenReader.Say(Loc.Get("dialog_no_buttons"));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_no_buttons"));
 		}
 		else if (_focusIndex >= 0 && _focusIndex < _buttons.Count)
 		{
-			ScreenReader.Say(Loc.Get("dialog_focused_button", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_focused_button", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count), AnnouncementPriority.High);
 		}
 		else
 		{
-			ScreenReader.Say(Loc.Get("dialog_has_buttons", _buttons.Count));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_has_buttons", _buttons.Count), AnnouncementPriority.High);
 		}
 	}
 
-	public void Reset()
+	public void Deactivate()
 	{
 		_buttons.Clear();
 		_labels.Clear();
@@ -217,14 +221,35 @@ public class DialogHandler : IHandler
 		_textInputMode = false;
 		_activeInputField = null;
 		_lastInputText = "";
-		// Block input for 0.3s to prevent the Enter that triggered Reset from double-firing
+		// Block input for 0.3s to prevent the Enter that triggered Deactivate from double-firing
 		_inputBlockUntil = Time.time + 0.3f;
+		_holdRepeater.Reset();
+	}
+
+	public void OnSceneChanged(string sceneName)
+	{
+		_buttons.Clear();
+		_labels.Clear();
+		_screenTexts.Clear();
+		_focusIndex = -1;
+		_textReadIndex = -1;
+		_scanned = false;
+		_needsRescan = false;
+		_scanRoot = null;
+		_settingsMode = false;
+		_sliderAdjustMode = false;
+		_settingsItems.Clear();
+		_settingsIndex = -1;
+		_textInputMode = false;
+		_activeInputField = null;
+		_lastInputText = "";
+		_inputBlockUntil = 0f;
 	}
 
 	/// <summary>Reset with a delayed first scan, for cases where UI hasn't rendered yet.</summary>
 	public void ResetWithDelay(float delay = 0.5f)
 	{
-		Reset();
+		Deactivate();
 		// Prevent immediate scan — schedule it via the rescan mechanism
 		_scanned = true;
 		_needsRescan = true;
@@ -385,12 +410,12 @@ public class DialogHandler : IHandler
 			if (!SuppressNextAnnounce)
 			{
 				// Announce: first button + how many total
-				ScreenReader.Say(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
+				AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count), AnnouncementPriority.High);
 
 				// Queue screen text content so user hears it after button announcement
 				if (_screenTexts.Count > 0)
 				{
-					ScreenReader.SayQueued(string.Join(". ", _screenTexts));
+					AnnouncementService.Instance.Announce(string.Join(". ", _screenTexts), AnnouncementPriority.Low);
 				}
 			}
 			SuppressNextAnnounce = false;
@@ -402,7 +427,7 @@ public class DialogHandler : IHandler
 			// No buttons — just read the text content directly
 			if (_screenTexts.Count > 0)
 			{
-				ScreenReader.Say(string.Join(". ", _screenTexts));
+				AnnouncementService.Instance.Announce(string.Join(". ", _screenTexts));
 			}
 		}
 	}
@@ -696,7 +721,7 @@ public class DialogHandler : IHandler
 				$"Settings mode: {_settingsItems.Count} items ({sliderCount} sliders, {toggleCount} toggles)");
 
 			// Announce
-			ScreenReader.Say(Loc.Get("settings_entered", _settingsItems.Count));
+			AnnouncementService.Instance.Announce(Loc.Get("settings_entered", _settingsItems.Count), AnnouncementPriority.High);
 			AnnounceCurrentSetting();
 			return true;
 		}
@@ -827,7 +852,7 @@ public class DialogHandler : IHandler
 		string msg = string.IsNullOrEmpty(value)
 			? $"{item.Label}, {_settingsIndex + 1} of {_settingsItems.Count}"
 			: $"{item.Label}, {value}, {_settingsIndex + 1} of {_settingsItems.Count}";
-		ScreenReader.Say(msg);
+		AnnouncementService.Instance.Announce(msg);
 	}
 
 	private string GetSettingValue(SettingsItem item)
@@ -869,7 +894,7 @@ public class DialogHandler : IHandler
 				|| SDLInput.IsButtonDown(SDLInput.GamepadButton.South) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
 			{
 				_sliderAdjustMode = false;
-				ScreenReader.Say("Done adjusting. " + GetSettingValue(_settingsItems[_settingsIndex]));
+				AnnouncementService.Instance.Announce(Loc.Get("settings_done_adjusting", GetSettingValue(_settingsItems[_settingsIndex])));
 			}
 			return;
 		}
@@ -896,7 +921,7 @@ public class DialogHandler : IHandler
 			if (_settingsIndex >= 0 && _settingsIndex < _settingsItems.Count)
 			{
 				string value = GetSettingValue(_settingsItems[_settingsIndex]);
-				ScreenReader.Say(string.IsNullOrEmpty(value) ? _settingsItems[_settingsIndex].Label : value);
+				AnnouncementService.Instance.Announce(string.IsNullOrEmpty(value) ? _settingsItems[_settingsIndex].Label : value);
 			}
 		}
 		// Enter: activate button, toggle, or enter slider adjust mode
@@ -910,7 +935,7 @@ public class DialogHandler : IHandler
 			_settingsMode = false;
 			_sliderAdjustMode = false;
 			_settingsItems.Clear();
-			Reset();
+			Deactivate();
 		}
 	}
 
@@ -933,7 +958,7 @@ public class DialogHandler : IHandler
 						item.Slider.value = newVal;
 
 						float normalized = (newVal - item.Slider.minValue) / range;
-						ScreenReader.Say($"{Mathf.RoundToInt(normalized * 100)}%");
+						AnnouncementService.Instance.Announce($"{Mathf.RoundToInt(normalized * 100)}%");
 						DebugLogger.Log(LogCategory.Handler, "DialogHandler",
 							$"Slider {item.Label}: {Mathf.RoundToInt(normalized * 100)}%");
 					}
@@ -945,11 +970,11 @@ public class DialogHandler : IHandler
 						if (item.Toggle.isOn != newState)
 						{
 							item.Toggle.isOn = newState;
-							ScreenReader.Say(newState ? Loc.Get("settings_on") : Loc.Get("settings_off"));
+							AnnouncementService.Instance.AnnounceInterrupt(newState ? Loc.Get("settings_on") : Loc.Get("settings_off"));
 						}
 						else
 						{
-							ScreenReader.Say(newState ? Loc.Get("settings_already_on") : Loc.Get("settings_already_off"));
+							AnnouncementService.Instance.Announce(newState ? Loc.Get("settings_already_on") : Loc.Get("settings_already_off"));
 						}
 					}
 					break;
@@ -977,13 +1002,13 @@ public class DialogHandler : IHandler
 					if ((Object)(object)item.Toggle != (Object)null)
 					{
 						item.Toggle.isOn = !item.Toggle.isOn;
-						ScreenReader.Say(item.Toggle.isOn ? Loc.Get("settings_on") : Loc.Get("settings_off"));
+						AnnouncementService.Instance.AnnounceInterrupt(item.Toggle.isOn ? Loc.Get("settings_on") : Loc.Get("settings_off"));
 					}
 					break;
 				case SettingsItemType.Button:
 					if ((Object)(object)item.Button != (Object)null)
 					{
-						ScreenReader.Say(Loc.Get("dialog_activating", item.Label));
+						AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("dialog_activating", item.Label));
 						// Try onClick first, fall back to mouse simulation
 						if (!UIHelper.ClickButton(item.Button))
 							UIHelper.SimulateMouseClick(((Component)item.Button).gameObject);
@@ -996,7 +1021,7 @@ public class DialogHandler : IHandler
 					// Enter on slider enters adjust mode (Left/Right to change, Enter/Backspace to exit)
 					_sliderAdjustMode = true;
 					string value = GetSettingValue(item);
-					ScreenReader.Say($"Adjusting {item.Label}, {value}. Left and Right to change, Enter or Backspace to finish.");
+					AnnouncementService.Instance.Announce(Loc.Get("settings_adjusting", item.Label, value));
 					break;
 			}
 		}
@@ -1024,7 +1049,7 @@ public class DialogHandler : IHandler
 		_textInputMode = true;
 		_lastInputText = "";
 		try { _lastInputText = _activeInputField.text ?? ""; } catch { }
-		ScreenReader.Say(Loc.Get("dialog_editing", fieldName));
+		AnnouncementService.Instance.Announce(Loc.Get("dialog_editing", fieldName));
 		DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Entered text input mode: " + fieldName);
 	}
 
@@ -1051,9 +1076,9 @@ public class DialogHandler : IHandler
 			catch { }
 
 			if (string.IsNullOrEmpty(finalText))
-				ScreenReader.Say(Loc.Get("dialog_done_editing_empty"));
+				AnnouncementService.Instance.Announce(Loc.Get("dialog_done_editing_empty"));
 			else
-				ScreenReader.Say(Loc.Get("dialog_done_editing", finalText));
+				AnnouncementService.Instance.Announce(Loc.Get("dialog_done_editing", finalText));
 
 			DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Exited text input mode. Text: " + finalText);
 			// Block input briefly so Enter doesn't activate a button
@@ -1066,7 +1091,7 @@ public class DialogHandler : IHandler
 		{
 			_textInputMode = false;
 			try { _activeInputField.DeactivateInputField(); } catch { }
-			ScreenReader.Say(Loc.Get("dialog_editing_cancelled"));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_editing_cancelled"));
 			_inputBlockUntil = Time.time + 0.3f;
 			return;
 		}
@@ -1081,12 +1106,12 @@ public class DialogHandler : IHandler
 				{
 					// Characters added — speak the new portion
 					string added = currentText.Substring(_lastInputText.Length);
-					ScreenReader.Say(added);
+					AnnouncementService.Instance.Announce(added);
 				}
 				else if (currentText.Length < _lastInputText.Length)
 				{
 					// Characters deleted
-					ScreenReader.Say(Loc.Get("dialog_char_deleted"));
+					AnnouncementService.Instance.Announce(Loc.Get("dialog_char_deleted"));
 				}
 				_lastInputText = currentText;
 			}
@@ -1101,27 +1126,44 @@ public class DialogHandler : IHandler
 		// Block input briefly after reset to prevent double-activation
 		if (Time.time < _inputBlockUntil) return;
 
-		// 1. Button Navigation (Left/Right)
-		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-		{
+		// 1. Button Navigation (Left/Right) with hold-to-repeat
+		Action moveLeft = () => {
 			CleanupDestroyedButtons();
 			if (_buttons.Count == 0) return;
 			_focusIndex = (_focusIndex - 1 + _buttons.Count) % _buttons.Count;
 			_textReadIndex = -1;
-			ScreenReader.Say(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
-		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-		{
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
+		};
+		Action moveRight = () => {
 			CleanupDestroyedButtons();
 			if (_buttons.Count == 0) return;
 			_focusIndex = (_focusIndex + 1) % _buttons.Count;
 			_textReadIndex = -1;
-			ScreenReader.Say(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
-		}
-		// 2. Details (Down reads next screen text line)
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
+		};
+		if (_holdRepeater.Check(SDLInput.Key.Left, moveLeft)) { }
+		else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) moveLeft();
+		else if (_holdRepeater.Check(SDLInput.Key.Right, moveRight)) { }
+		else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) moveRight();
+		// 2. Details (Down reads next, Up reads previous screen text line)
 		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
 		{
 			ReadNextScreenText();
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
+		{
+			ReadPreviousScreenText();
+		}
+		// Home/End: jump to first/last button
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Home))
+		{
+			CleanupDestroyedButtons();
+			if (_buttons.Count > 0) { _focusIndex = 0; _textReadIndex = -1; AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(0), 1, _buttons.Count)); }
+		}
+		else if (SDLInput.IsKeyDown(SDLInput.Key.End))
+		{
+			CleanupDestroyedButtons();
+			if (_buttons.Count > 0) { _focusIndex = _buttons.Count - 1; _textReadIndex = -1; AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count)); }
 		}
 		// 3. Activation (Enter)
 		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
@@ -1151,7 +1193,7 @@ public class DialogHandler : IHandler
 				{
 					UIHelper.ClickButton(_buttons[i]);
 					DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Closed dialog via: " + goName);
-					Reset();
+					Deactivate();
 					return;
 				}
 			}
@@ -1193,7 +1235,7 @@ public class DialogHandler : IHandler
 				{
 					UIHelper.ClickButton(fallback);
 					DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Closed via back button: " + ((Object)((Component)fallback).gameObject).name);
-					Reset();
+					Deactivate();
 					return;
 				}
 			}
@@ -1208,17 +1250,17 @@ public class DialogHandler : IHandler
 	{
 		if (_screenTexts.Count == 0)
 		{
-			ScreenReader.Say(Loc.Get("dialog_no_text"));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_no_text"));
 			return;
 		}
 		_textReadIndex++;
 		if (_textReadIndex >= _screenTexts.Count)
 		{
 			_textReadIndex = _screenTexts.Count - 1;
-			ScreenReader.Say(Loc.Get("dialog_end_of_text"));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_end_of_text"));
 			return;
 		}
-		ScreenReader.Say(Loc.Get("dialog_text_line", _screenTexts[_textReadIndex], _textReadIndex + 1, _screenTexts.Count));
+		AnnouncementService.Instance.Announce(Loc.Get("dialog_text_line", _screenTexts[_textReadIndex], _textReadIndex + 1, _screenTexts.Count));
 	}
 
 	private void ReadPreviousScreenText()
@@ -1226,7 +1268,7 @@ public class DialogHandler : IHandler
 		if (_screenTexts.Count == 0) return;
 		_textReadIndex--;
 		if (_textReadIndex < 0) _textReadIndex = 0;
-		ScreenReader.Say(Loc.Get("dialog_text_line", _screenTexts[_textReadIndex], _textReadIndex + 1, _screenTexts.Count));
+		AnnouncementService.Instance.Announce(Loc.Get("dialog_text_line", _screenTexts[_textReadIndex], _textReadIndex + 1, _screenTexts.Count));
 	}
 
 	private void ActivateFocused()
@@ -1234,7 +1276,7 @@ public class DialogHandler : IHandler
 		CleanupDestroyedButtons();
 		if (_focusIndex < 0 || _focusIndex >= _buttons.Count)
 		{
-			ScreenReader.Say(Loc.Get("dialog_no_focus"));
+			AnnouncementService.Instance.Announce(Loc.Get("dialog_no_focus"));
 			return;
 		}
 		Button button = _buttons[_focusIndex];
@@ -1248,7 +1290,7 @@ public class DialogHandler : IHandler
 		}
 
 		DebugLogger.LogInput("Enter", "Clicking: " + label);
-		ScreenReader.Say(Loc.Get("dialog_activating", label));
+		AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("dialog_activating", label));
 		if (!UIHelper.ClickButton(button))
 			UIHelper.SimulateMouseClick(((Component)button).gameObject);
 
