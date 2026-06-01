@@ -127,6 +127,17 @@ This mod is based on the foundational work and initial builds by **Amethyst** ([
 ### Repository Structure
 - **Root**: Essential DLLs for players and `README.md`.
 - `src/`: Mod source code (.cs files), project file (.csproj), and `scripts/`.
+- `tests/`: Unit tests for the game-free logic (see below).
+
+### Running the Tests
+
+The mod itself (`src/SnapAccess.csproj`) references Il2Cpp game assemblies that only exist on a machine with Marvel Snap and MelonLoader installed, so it cannot build on a clean CI runner. The logic that does not depend on the game (string localization, settings serialization, update-version comparison, and the announcement priority and cooldown rules) is tested in a separate project that links those source files directly:
+
+```bash
+dotnet test tests/SnapAccess.Core.Tests
+```
+
+These tests need only the .NET 10 SDK (no game install) and run automatically in CI on every push and pull request. When fixing a bug or adding logic in one of the covered files, add a failing test first.
 
 ---
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Game-free `SnapAccess.Core.Tests` xUnit project covering the logic that does not need the game (`Loc`, `ModSettings`, `UpdateChecker`, `AnnouncementService`), plus a GitHub Actions CI workflow that builds and runs it.
+- `LICENSE` file (MIT), which the README already referenced.
+
+### Fixed
+- **Update checker version comparison** compared versions lexically, so `0.10.0` was treated as older than `0.9.0`, and a downgrade counted as an available update. It now compares version components numerically.
+- **Settings persistence** read the JSON line by line, so a settings file written on a single line parsed to all-default values and silently discarded the user's choices. Parsing is now independent of layout.
+- **Update checker never ran** because its target repository was never configured. It is now wired to the upstream repository on mod load.
+
+### Changed
+- `AnnouncementService` now takes an injectable speech-output seam and clock instead of calling the screen-reader bridge and the system clock directly. Behavior is unchanged; the two identical High/Immediate branches were collapsed into one.
+
+---
+
 ## v0.5.0 — 2026-05-29
 
 ### Architecture Overhaul (v0.3)
