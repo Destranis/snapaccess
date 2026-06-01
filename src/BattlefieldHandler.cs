@@ -108,6 +108,7 @@ public class BattlefieldHandler : IScreenNavigator
     // Opponent card detection: don't announce before the game has started properly
     private bool _gameReadyForOpponentDetection = false;
     private int _turnChangeCount = 0;
+    private readonly TurnAnnounceGate _turnGate = new TurnAnnounceGate();
     private float _opponentScanCooldownUntil = 0f; // Block scanning briefly after turn changes (animations)
 
     // Card draw tracking: EntityIds of cards that were in hand last scan
@@ -285,6 +286,7 @@ public class BattlefieldHandler : IScreenNavigator
         _gameReadyForOpponentDetection = false;
         _opponentScanCooldownUntil = 0f;
         _turnChangeCount = 0;
+        _turnGate.Reset();
         _gameOverAnnounced = false;
         _gameOverCheckTime = 0f;
         _lastPostGameCheck = 0f;
@@ -3994,9 +3996,17 @@ public class BattlefieldHandler : IScreenNavigator
             // Ultra-concise: "Turn 3, energy 3, go." — minimize speech time so user can act fast
             string msg;
             if (turnText == "FINAL")
+            {
+                if (!_turnGate.ShouldAnnounce("FINAL")) return;
                 msg = Loc.Get("bf_turn_start_final", energy ?? "?");
+            }
             else if (turnText != null)
+            {
+                // Suppress re-announcing the same turn when the hand count changed
+                // because a card was played rather than because the turn advanced.
+                if (!_turnGate.ShouldAnnounce(turnText)) return;
                 msg = Loc.Get("bf_turn_start", turnText, energy ?? "?");
+            }
             else
                 msg = Loc.Get("bf_your_turn");
 
@@ -4513,6 +4523,7 @@ public class BattlefieldHandler : IScreenNavigator
         _playVerifyExpectedCount = -1;
         _gameReadyForOpponentDetection = false;
         _turnChangeCount = 0;
+        _turnGate.Reset();
         _opponentNameAnnounced = false;
     }
 

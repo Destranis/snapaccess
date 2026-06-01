@@ -34,6 +34,7 @@
     <Compile Include="..\..\src\ISpeechOutput.cs" Link="Linked\ISpeechOutput.cs" />
     <Compile Include="..\..\src\AnnouncementService.cs" Link="Linked\AnnouncementService.cs" />
     <Compile Include="..\..\src\TurnTextParser.cs" Link="Linked\TurnTextParser.cs" />
+    <Compile Include="..\..\src\TurnAnnounceGate.cs" Link="Linked\TurnAnnounceGate.cs" />
   </ItemGroup>
 
 </Project>
