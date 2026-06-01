@@ -36,6 +36,10 @@ public class Main : MelonMod
         SDLInput.Initialize();
         Loc.Initialize();
 
+        // Check the upstream repo for a newer release (non-blocking, fire-and-forget).
+        UpdateChecker.Configure("Destranis", "snapaccess");
+        UpdateChecker.CheckAsync();
+
         InitializeNavigators();
 
         MelonCoroutines.Start(AnnounceStartupDelayed());
