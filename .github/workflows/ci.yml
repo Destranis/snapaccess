@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  core-tests:
+    name: Core tests (game-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.x"
+
+      # The mod project (src/SnapAccess.csproj) references Il2Cpp game assemblies
+      # that only exist on a machine with Marvel Snap + MelonLoader installed, so
+      # it cannot build in CI. The Core test project links the game-free source
+      # files directly and is the only thing built/tested here.
+      - name: Restore
+        run: dotnet restore tests/SnapAccess.Core.Tests/SnapAccess.Core.Tests.csproj
+
+      - name: Test (with coverage)
+        run: >
+          dotnet test tests/SnapAccess.Core.Tests/SnapAccess.Core.Tests.csproj
+          -c Release
+          --collect:"XPlat Code Coverage"
+          --results-directory ./coverage
