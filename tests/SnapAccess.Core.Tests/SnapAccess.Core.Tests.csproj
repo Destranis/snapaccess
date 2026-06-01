@@ -33,6 +33,7 @@
     <Compile Include="..\..\src\AnnouncementPriority.cs" Link="Linked\AnnouncementPriority.cs" />
     <Compile Include="..\..\src\ISpeechOutput.cs" Link="Linked\ISpeechOutput.cs" />
     <Compile Include="..\..\src\AnnouncementService.cs" Link="Linked\AnnouncementService.cs" />
+    <Compile Include="..\..\src\TurnTextParser.cs" Link="Linked\TurnTextParser.cs" />
   </ItemGroup>
 
 </Project>

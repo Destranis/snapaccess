@@ -3995,11 +3995,8 @@ public class BattlefieldHandler : IScreenNavigator
             string msg;
             if (turnText == "FINAL")
                 msg = Loc.Get("bf_turn_start_final", energy ?? "?");
-            else if (turnText != null && turnText.Contains("/"))
-            {
-                string[] split = turnText.Split('/');
-                msg = Loc.Get("bf_turn_start", split[0].Trim(), energy ?? "?");
-            }
+            else if (turnText != null)
+                msg = Loc.Get("bf_turn_start", turnText, energy ?? "?");
             else
                 msg = Loc.Get("bf_your_turn");
 
@@ -4013,7 +4010,7 @@ public class BattlefieldHandler : IScreenNavigator
         }
     }
 
-    /// <summary>Gets the raw turn text (e.g. "3 / 6" or "FINAL TURN") without announcing it.</summary>
+    /// <summary>Returns the current turn number (e.g. "3"), the sentinel "FINAL", or null. Does not announce.</summary>
     private string GetTurnText()
     {
         try
@@ -4030,12 +4027,11 @@ public class BattlefieldHandler : IScreenNavigator
                 {
                     string val = t.text;
                     if (string.IsNullOrEmpty(val)) continue;
-                    val = val.Trim();
-                    // Normal format: "3 / 6"
-                    if (val.Contains("/")) return val;
-                    // Final turn: text says "FINAL TURN" or similar without a slash
-                    if (val.Contains("FINAL", StringComparison.OrdinalIgnoreCase))
-                        return "FINAL";
+                    // The label is TMP rich text such as "<size=490>2</size> / 6";
+                    // TurnTextParser strips the markup before splitting on '/' so the
+                    // closing "</size>" tag's slash can't corrupt the turn number.
+                    string current = TurnTextParser.ParseCurrent(val);
+                    if (current != null) return current;
                 }
             }
         }
