@@ -30,6 +30,9 @@
     <Compile Include="..\..\src\Loc.cs" Link="Linked\Loc.cs" />
     <Compile Include="..\..\src\ModSettings.cs" Link="Linked\ModSettings.cs" />
     <Compile Include="..\..\src\UpdateChecker.cs" Link="Linked\UpdateChecker.cs" />
+    <Compile Include="..\..\src\AnnouncementPriority.cs" Link="Linked\AnnouncementPriority.cs" />
+    <Compile Include="..\..\src\ISpeechOutput.cs" Link="Linked\ISpeechOutput.cs" />
+    <Compile Include="..\..\src\AnnouncementService.cs" Link="Linked\AnnouncementService.cs" />
   </ItemGroup>
 
 </Project>
