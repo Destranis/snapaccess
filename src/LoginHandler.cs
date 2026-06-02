@@ -511,28 +511,23 @@ public class LoginHandler : IScreenNavigator
         if (Time.time < _inputBlockUntil) return;
         if (_elements.Count == 0) return;
 
-        // Left/Right: navigate elements
-        if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+        // Up/Down: navigate elements in list
+        if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
         {
             MoveFocus(-1);
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
         {
             MoveFocus(1);
         }
-        // Down: read next screen text
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
-        {
-            ReadNextScreenText();
-        }
-        // Up: read previous screen text
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
-        {
-            ReadPreviousScreenText();
-        }
-        // Enter/Space: activate focused element
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsKeyDown(SDLInput.Key.Space)
+        // Enter: activate focused element (edit field, press button, toggle checkbox)
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Return)
             || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
+        {
+            ActivateFocused();
+        }
+        // Space: activate (secondary)
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Space))
         {
             ActivateFocused();
         }
@@ -571,8 +566,7 @@ public class LoginHandler : IScreenNavigator
             case ElementType.Button:
                 DebugLogger.LogInput("Enter", "Login: clicking " + elem.Label);
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("dialog_activating", elem.Label));
-                if (!UIHelper.ClickButton(elem.Button))
-                    UIHelper.SimulateMouseClick(((Component)elem.Button).gameObject);
+                UIHelper.ActivateButton(elem.Button);
                 // Force rescan after action
                 _lastElementHash = 0;
                 _inputBlockUntil = Time.time + 0.5f;
@@ -765,6 +759,9 @@ public class LoginHandler : IScreenNavigator
         _lastInputText = "";
         try { _lastInputText = _activeInputField.text ?? ""; } catch { }
         AnnouncementService.Instance.Announce(Loc.Get("dialog_editing", fieldName));
+        // Announce current content if non-empty
+        if (!string.IsNullOrEmpty(_lastInputText))
+            AnnouncementService.Instance.Announce(Loc.Get("login_field_current", _lastInputText), AnnouncementPriority.Low);
         DebugLogger.Log(LogCategory.Handler, "LoginHandler", "Entered text input mode: " + fieldName);
     }
 
@@ -804,6 +801,23 @@ public class LoginHandler : IScreenNavigator
             return;
         }
 
+        // Up/Down: read full field content (AccessibleArena pattern)
+        if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsKeyDown(SDLInput.Key.Down))
+        {
+            try
+            {
+                string content = _activeInputField.text ?? "";
+                if (string.IsNullOrEmpty(content))
+                    AnnouncementService.Instance.Announce(Loc.Get("login_field_empty"), AnnouncementPriority.Immediate);
+                else
+                    AnnouncementService.Instance.Announce(content, AnnouncementPriority.Immediate);
+                // Reactivate the field (Unity can deactivate it on arrow keys)
+                try { _activeInputField.ActivateInputField(); } catch { }
+            }
+            catch { }
+            return;
+        }
+
         // Track text changes and speak new characters
         try
         {
@@ -813,11 +827,11 @@ public class LoginHandler : IScreenNavigator
                 if (currentText.Length > _lastInputText.Length)
                 {
                     string added = currentText.Substring(_lastInputText.Length);
-                    AnnouncementService.Instance.Announce(added);
+                    AnnouncementService.Instance.Announce(added, AnnouncementPriority.Immediate);
                 }
                 else if (currentText.Length < _lastInputText.Length)
                 {
-                    AnnouncementService.Instance.Announce(Loc.Get("dialog_char_deleted"));
+                    AnnouncementService.Instance.Announce(Loc.Get("dialog_char_deleted"), AnnouncementPriority.Immediate);
                 }
                 _lastInputText = currentText;
             }

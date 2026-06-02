@@ -187,6 +187,45 @@ public static class UIHelper
         return SimulateMouseClick(((Component)button).gameObject);
     }
 
+    /// <summary>
+    /// Activates a UI element using the best available click strategy.
+    /// Tries Button.onClick.Invoke() first, then SimulateMouseClick as fallback.
+    /// </summary>
+    public static bool ActivateButton(GameObject go)
+    {
+        if ((Object)(object)go == (Object)null) return false;
+        try
+        {
+            // Strategy 1: Button.onClick.Invoke()
+            Button button = go.GetComponent<Button>();
+            if ((Object)(object)button == (Object)null)
+                button = go.GetComponentInChildren<Button>(false);
+            if ((Object)(object)button != (Object)null)
+            {
+                ((UnityEvent)button.onClick).Invoke();
+                DebugLogger.Log(LogCategory.Handler, "UIHelper",
+                    "ActivateButton via onClick: " + ((Object)go).name);
+                return true;
+            }
+
+            // Strategy 2: SimulateMouseClick — real Windows mouse events at element position
+            return SimulateMouseClick(go);
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "UIHelper",
+                "ActivateButton failed on " + ((Object)go).name + ": " + ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>Activates a Button via onClick.Invoke() with SimulateMouseClick fallback.</summary>
+    public static bool ActivateButton(Button button)
+    {
+        if ((Object)(object)button == (Object)null) return false;
+        return ActivateButton(((Component)button).gameObject);
+    }
+
     /// <summary>Send a pointer click and submit event through Unity's EventSystem. Works even if the button is off-screen.</summary>
     public static bool SendPointerClick(GameObject go)
     {
@@ -209,6 +248,81 @@ public static class UIHelper
             DebugLogger.Log(LogCategory.Handler, "UIHelper", "SendPointerClick failed: " + ex.Message);
             return false;
         }
+    }
+
+    /// <summary>
+    /// Full MTGA-style pointer click simulation.
+    /// Creates proper PointerEventData with screen position, pointerPress, and pointerEnter
+    /// (matching MTGA's CreatePointerEventData exactly), then sends the complete event sequence.
+    /// </summary>
+    public static bool SimulatePointerClick(GameObject go)
+    {
+        if ((Object)(object)go == (Object)null) return false;
+        try
+        {
+            // MTGA CreatePointerEventData pattern: compute element screen position
+            Vector2 screenPos = GetElementScreenPosition(go);
+            var eventData = new PointerEventData(EventSystem.current)
+            {
+                button = PointerEventData.InputButton.Left,
+                clickCount = 1,
+                pointerPress = go,
+                pointerEnter = go,
+                position = screenPos,
+                pressPosition = screenPos
+            };
+
+            // Set as selected object first (MTGA pattern)
+            EventSystem current = EventSystem.current;
+            if ((Object)(object)current != (Object)null)
+            {
+                current.SetSelectedGameObject(go);
+            }
+
+            // Full pointer event sequence
+            ExecuteEvents.Execute(go, eventData, ExecuteEvents.pointerEnterHandler);
+            ExecuteEvents.Execute(go, eventData, ExecuteEvents.pointerDownHandler);
+            ExecuteEvents.Execute(go, eventData, ExecuteEvents.pointerUpHandler);
+            ExecuteEvents.Execute(go, eventData, ExecuteEvents.pointerClickHandler);
+
+            DebugLogger.Log(LogCategory.Handler, "UIHelper",
+                "SimulatePointerClick on " + ((Object)go).name + " at " + screenPos);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "UIHelper", "SimulatePointerClick failed: " + ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Gets the screen position of a UI element, matching MTGA's GetScreenPosition().
+    /// Uses RectTransform world corners with camera conversion for non-overlay canvases.
+    /// </summary>
+    private static Vector2 GetElementScreenPosition(GameObject go)
+    {
+        try
+        {
+            RectTransform rt = go.GetComponent<RectTransform>();
+            if ((Object)(object)rt != (Object)null)
+            {
+                Vector3[] corners = new Vector3[4];
+                rt.GetWorldCorners(corners);
+                Vector3 center = (corners[0] + corners[2]) / 2f;
+                Canvas canvas = go.GetComponentInParent<Canvas>();
+                if ((Object)(object)canvas != (Object)null
+                    && canvas.renderMode == RenderMode.ScreenSpaceCamera
+                    && (Object)(object)canvas.worldCamera != (Object)null)
+                {
+                    return canvas.worldCamera.WorldToScreenPoint(center);
+                }
+                return new Vector2(center.x, center.y);
+            }
+        }
+        catch { }
+        // Fallback: screen center
+        return new Vector2(Screen.width / 2f, Screen.height / 2f);
     }
 
     /// <summary>Simulate a mouse click on a GameObject's screen position using P/Invoke.</summary>

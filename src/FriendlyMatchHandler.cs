@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Il2CppTMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -10,7 +11,7 @@ namespace SnapAccess;
 
 /// <summary>
 /// Handles the Friendly Match (Battle Mode) screen.
-/// Flat navigation: Left/Right between Create and Join.
+/// Flat navigation: Up/Down between Create and Join.
 /// Enter activates directly. No sub-menus.
 /// </summary>
 public class FriendlyMatchHandler : IScreenNavigator
@@ -96,7 +97,7 @@ public class FriendlyMatchHandler : IScreenNavigator
             // Last resort: look for create/join buttons anywhere
             if (_root == null)
             {
-                Button[] allBtns = Object.FindObjectsOfType<Button>();
+                Il2CppArrayBase<Button> allBtns = Object.FindObjectsOfType<Button>();
                 foreach (var b in allBtns)
                 {
                     if (b == null || !b.gameObject.activeInHierarchy) continue;
@@ -140,17 +141,17 @@ public class FriendlyMatchHandler : IScreenNavigator
             return;
         }
 
-        if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+        if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
         {
             _focus = FocusItem.Create;
             AnnounceFocus();
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
         {
             _focus = FocusItem.Join;
             AnnounceFocus();
         }
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
         {
             ReadDetails();
         }
@@ -193,7 +194,7 @@ public class FriendlyMatchHandler : IScreenNavigator
             if (_joinButton != null)
             {
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("fm_joining", code));
-                UIHelper.ClickButtonWithFallback(_joinButton);
+                UIHelper.ActivateButton(_joinButton);
             }
             else
             {
@@ -269,7 +270,7 @@ public class FriendlyMatchHandler : IScreenNavigator
             else if (_createButton != null)
             {
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("fm_creating"));
-                UIHelper.ClickButtonWithFallback(_createButton);
+                UIHelper.ActivateButton(_createButton);
                 // After creating, try to read the generated code
                 MelonLoader.MelonCoroutines.Start(AnnounceGeneratedCodeDelayed());
             }
@@ -305,7 +306,7 @@ public class FriendlyMatchHandler : IScreenNavigator
         try
         {
             // Look for text elements that might contain the generated code
-            TMP_Text[] texts = _root.GetComponentsInChildren<TMP_Text>(true);
+            Il2CppArrayBase<TMP_Text> texts = _root.GetComponentsInChildren<TMP_Text>(true);
             foreach (var t in texts)
             {
                 if (t == null) continue;
@@ -358,7 +359,7 @@ public class FriendlyMatchHandler : IScreenNavigator
     private Button FindButton(string goNamePattern, string labelKeyword)
     {
         if (_root == null) return null;
-        Button[] buttons = _root.GetComponentsInChildren<Button>(true);
+        Il2CppArrayBase<Button> buttons = _root.GetComponentsInChildren<Button>(true);
 
         // First: exact name match
         foreach (var b in buttons)
@@ -388,7 +389,7 @@ public class FriendlyMatchHandler : IScreenNavigator
             if (escBtn != null)
             {
                 Button b = escBtn.GetComponentInChildren<Button>(true);
-                if (b != null) { UIHelper.ClickButton(b); closed = true; }
+                if (b != null) { UIHelper.ActivateButton(b); closed = true; }
             }
         }
         catch { }

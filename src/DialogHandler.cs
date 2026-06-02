@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
 using UnityEngine.UI;
@@ -13,7 +14,7 @@ namespace SnapAccess;
 /// <summary>
 /// Handles UI button navigation on menu sub-screens.
 /// Scans the topmost active content canvas (not Navigator, not FullscreenModals).
-/// Provides Left/Right + Enter navigation and Down for screen content reading.
+/// Provides Up/Down + Enter navigation and Right/Left for screen content reading.
 /// </summary>
 /// <summary>
 /// Handles UI button navigation on menu sub-screens.
@@ -42,7 +43,7 @@ public class DialogHandler : IScreenNavigator
 	private GameObject _scanRoot = null;
 
 	// --- Settings mode ---
-	private enum SettingsItemType { Slider, Toggle, Button }
+	private enum SettingsItemType { Slider, Toggle, Button, ActionComponent }
 
 	private struct SettingsItem
 	{
@@ -51,18 +52,22 @@ public class DialogHandler : IScreenNavigator
 		public Slider Slider;
 		public Toggle Toggle;
 		public Button Button;
+		/// <summary>For ActionComponent type: the MonoBehaviour to invoke via reflection.</summary>
+		public Component ActionTarget;
+		/// <summary>For ActionComponent type: the method name to call.</summary>
+		public string ActionMethod;
 	}
 
 	private bool _settingsMode = false;
 	private readonly List<SettingsItem> _settingsItems = new List<SettingsItem>();
 	private int _settingsIndex = -1;
-	private bool _sliderAdjustMode = false; // When true, Left/Right adjusts slider value
 	private const float SliderStep = 0.05f; // 5% per Left/Right press
 
 	// --- Text input mode ---
 	private bool _textInputMode = false;
 	private TMP_InputField _activeInputField = null;
 	private string _lastInputText = "";
+	private int _inputFieldButtonIndex = -1; // Index in _buttons/_labels for standalone input field entry
 
 	// GameObjects to exclude from scanning (by name pattern)
 	// NOTE: Canvas-Rewards is NOT excluded — the scoring system naturally deprioritises it
@@ -215,12 +220,12 @@ public class DialogHandler : IScreenNavigator
 		_needsRescan = false;
 		_scanRoot = null;
 		_settingsMode = false;
-		_sliderAdjustMode = false;
 		_settingsItems.Clear();
 		_settingsIndex = -1;
 		_textInputMode = false;
 		_activeInputField = null;
 		_lastInputText = "";
+		_inputFieldButtonIndex = -1;
 		// Block input for 0.3s to prevent the Enter that triggered Deactivate from double-firing
 		_inputBlockUntil = Time.time + 0.3f;
 		_holdRepeater.Reset();
@@ -237,12 +242,12 @@ public class DialogHandler : IScreenNavigator
 		_needsRescan = false;
 		_scanRoot = null;
 		_settingsMode = false;
-		_sliderAdjustMode = false;
 		_settingsItems.Clear();
 		_settingsIndex = -1;
 		_textInputMode = false;
 		_activeInputField = null;
 		_lastInputText = "";
+		_inputFieldButtonIndex = -1;
 		_inputBlockUntil = 0f;
 	}
 
@@ -310,8 +315,59 @@ public class DialogHandler : IScreenNavigator
 			_labels.Add(label);
 		}
 
+		// Also scan for non-interactable buttons — dialogs often disable buttons during animation
+		// or until user fills in required fields (e.g., Confirm disabled until name entered)
+		if ((Object)(object)_scanRoot != (Object)null)
+		{
+			try
+			{
+				Il2CppArrayBase<Button> allBtns = _scanRoot.GetComponentsInChildren<Button>(false);
+				if (allBtns != null)
+				{
+					for (int i = 0; i < allBtns.Count; i++)
+					{
+						Button btn = allBtns[i];
+						if ((Object)(object)btn == (Object)null) continue;
+						if (!((Component)btn).gameObject.activeInHierarchy) continue;
+						if (((Selectable)btn).interactable) continue; // Already found above
+
+						if (IsExcludedButton(btn)) continue;
+						try
+						{
+							string goName = ((Object)((Component)btn).gameObject).name;
+							if (goName.Contains("Background", StringComparison.OrdinalIgnoreCase)
+							    && (goName.Contains("Close", StringComparison.OrdinalIgnoreCase)
+							        || goName.Contains("Panel", StringComparison.OrdinalIgnoreCase)
+							        || goName.Contains("Button", StringComparison.OrdinalIgnoreCase)))
+								continue;
+						}
+						catch { }
+
+						string label = BuildLabel(btn);
+						if (IsJunkLabel(label)) continue;
+
+						// Skip if a button with this label already exists
+						bool dup = false;
+						for (int j = 0; j < _labels.Count; j++)
+						{
+							if (_labels[j].Equals(label, StringComparison.OrdinalIgnoreCase))
+							{ dup = true; break; }
+						}
+						if (dup) continue;
+
+						_buttons.Add(btn);
+						_labels.Add(label);
+						DebugLogger.Log(LogCategory.Handler, "DialogHandler",
+							$"Added non-interactable button: '{label}'");
+					}
+				}
+			}
+			catch { }
+		}
+
 		// Scan for text input fields
 		_activeInputField = null;
+		_inputFieldButtonIndex = -1;
 		try
 		{
 			if ((Object)(object)_scanRoot != (Object)null)
@@ -325,16 +381,14 @@ public class DialogHandler : IScreenNavigator
 						if ((Object)(object)field == (Object)null) continue;
 						if (!((Component)field).gameObject.activeInHierarchy) continue;
 						_activeInputField = field;
-						// Add it as a browsable "button" if not already present
-						string fieldLabel = "Text field";
-						try
-						{
-							string placeholder = field.placeholder != null ?
-								UIHelper.StripRichText(((TMP_Text)field.placeholder).text) : "";
-							if (!string.IsNullOrEmpty(placeholder) && placeholder.Length > 2)
-								fieldLabel = placeholder;
-						}
-						catch { }
+
+						// Build a good label: try sibling/parent text, then placeholder, then GO name
+						string fieldLabel = GetInputFieldLabel(field);
+
+						// Include current value in the label
+						string currentValue = "";
+						try { currentValue = field.text ?? ""; } catch { }
+
 						// Check if there's already a button for this GO
 						bool alreadyAdded = false;
 						for (int j = 0; j < _buttons.Count; j++)
@@ -345,28 +399,49 @@ public class DialogHandler : IScreenNavigator
 									((Component)_buttons[j]).transform.IsChildOf(((Component)field).transform) ||
 									((Component)field).transform.IsChildOf(((Component)_buttons[j]).transform))
 								{
-									_labels[j] = fieldLabel + " (press Enter to type)";
+									string editLabel = fieldLabel;
+									if (!string.IsNullOrEmpty(currentValue))
+										editLabel += ": " + currentValue;
+									_labels[j] = editLabel + " (press Enter to type)";
+									_inputFieldButtonIndex = j;
 									alreadyAdded = true;
 									break;
 								}
 							}
 							catch { }
 						}
-						// Fallback: match by label text (placeholder text == button label)
+						// Fallback: match by label text
 						if (!alreadyAdded && fieldLabel.Length > 2)
 						{
 							for (int j = 0; j < _labels.Count; j++)
 							{
 								if (_labels[j].Equals(fieldLabel, StringComparison.OrdinalIgnoreCase))
 								{
-									_labels[j] = fieldLabel + " (press Enter to type)";
+									string editLabel = fieldLabel;
+									if (!string.IsNullOrEmpty(currentValue))
+										editLabel += ": " + currentValue;
+									_labels[j] = editLabel + " (press Enter to type)";
+									_inputFieldButtonIndex = j;
 									alreadyAdded = true;
 									break;
 								}
 							}
 						}
+						// If the input field is standalone (not associated with any button),
+						// add it as a navigable entry at the top of the list
+						if (!alreadyAdded)
+						{
+							string editLabel = fieldLabel;
+							if (!string.IsNullOrEmpty(currentValue))
+								editLabel += ": " + currentValue;
+							editLabel += " (press Enter to type)";
+							// Insert at position 0 so it's the first thing the user lands on
+							_buttons.Insert(0, null);
+							_labels.Insert(0, editLabel);
+							_inputFieldButtonIndex = 0;
+						}
 						DebugLogger.Log(LogCategory.Handler, "DialogHandler",
-							$"Input field found: '{fieldLabel}', associated={alreadyAdded}");
+							$"Input field found: '{fieldLabel}', value='{currentValue}', associated={alreadyAdded}");
 						break; // Only handle first input field
 					}
 				}
@@ -409,14 +484,14 @@ public class DialogHandler : IScreenNavigator
 
 			if (!SuppressNextAnnounce)
 			{
-				// Announce: first button + how many total
-				AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count), AnnouncementPriority.High);
-
-				// Queue screen text content so user hears it after button announcement
+				// Announce screen text FIRST so user knows what this dialog is about
 				if (_screenTexts.Count > 0)
 				{
-					AnnouncementService.Instance.Announce(string.Join(". ", _screenTexts), AnnouncementPriority.Low);
+					AnnouncementService.Instance.Announce(string.Join(". ", _screenTexts), AnnouncementPriority.High);
 				}
+
+				// Then announce focused element
+				AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count), AnnouncementPriority.Normal);
 			}
 			SuppressNextAnnounce = false;
 		}
@@ -714,6 +789,10 @@ public class DialogHandler : IScreenNavigator
 				});
 			}
 
+			// Scan for special action components (e.g. AccountLogoutButton)
+			// These are MonoBehaviours with click handlers that aren't standard Buttons
+			ScanActionComponents(_scanRoot);
+
 			if (_settingsItems.Count == 0) return false;
 
 			_settingsIndex = 0;
@@ -729,6 +808,66 @@ public class DialogHandler : IScreenNavigator
 		{
 			DebugLogger.Log(LogCategory.Handler, "DialogHandler", "TryScanAsSettings failed: " + ex.Message);
 			return false;
+		}
+	}
+
+	/// <summary>
+	/// Scans for game-specific action components (MonoBehaviours with click handlers)
+	/// that aren't standard Unity Buttons but should appear in the settings list.
+	/// </summary>
+	private void ScanActionComponents(GameObject root)
+	{
+		if ((Object)(object)root == (Object)null) return;
+		try
+		{
+			// Map of component type name patterns to their click method and label
+			var actionPatterns = new (string TypePattern, string MethodName, string Label)[]
+			{
+				("AccountLogoutButton", "OnButtonClick", "Sign Out"),
+			};
+
+			Il2CppArrayBase<MonoBehaviour> behaviours = root.GetComponentsInChildren<MonoBehaviour>(false);
+			if (behaviours == null) return;
+
+			for (int i = 0; i < behaviours.Count; i++)
+			{
+				MonoBehaviour mb = behaviours[i];
+				if ((Object)(object)mb == (Object)null) continue;
+				if (!((Component)mb).gameObject.activeInHierarchy) continue;
+
+				string typeName = mb.GetType().Name;
+				foreach (var (pattern, method, label) in actionPatterns)
+				{
+					if (!typeName.Contains(pattern)) continue;
+
+					// Verify the method exists
+					var methodInfo = mb.GetType().GetMethod(method,
+						System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+					if (methodInfo == null) continue;
+
+					// Check we don't already have this as a regular button
+					bool duplicate = false;
+					foreach (var existing in _settingsItems)
+					{
+						if (existing.Label == label) { duplicate = true; break; }
+					}
+					if (duplicate) continue;
+
+					_settingsItems.Add(new SettingsItem
+					{
+						Label = label,
+						Type = SettingsItemType.ActionComponent,
+						ActionTarget = (Component)mb,
+						ActionMethod = method,
+					});
+					DebugLogger.Log(LogCategory.Handler, "DialogHandler",
+						$"Found action component: {typeName}.{method} -> \"{label}\"");
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			DebugLogger.Log(LogCategory.Handler, "DialogHandler", "ScanActionComponents error: " + ex.Message);
 		}
 	}
 
@@ -883,58 +1022,42 @@ public class DialogHandler : IScreenNavigator
 	{
 		if (Time.time < _inputBlockUntil) return;
 
-		// Slider adjust mode: Left/Right adjusts value, Backspace/Enter exits
-		if (_sliderAdjustMode)
-		{
-			if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
-				AdjustCurrentSetting(-1);
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
-				AdjustCurrentSetting(1);
-			else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsKeyDown(SDLInput.Key.Backspace)
-				|| SDLInput.IsButtonDown(SDLInput.GamepadButton.South) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
-			{
-				_sliderAdjustMode = false;
-				AnnouncementService.Instance.Announce(Loc.Get("settings_done_adjusting", GetSettingValue(_settingsItems[_settingsIndex])));
-			}
-			return;
-		}
-
-		// Left: previous item
-		if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
+		// Up: previous setting
+		if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
 		{
 			if (_settingsItems.Count == 0) return;
 			_settingsIndex--;
 			if (_settingsIndex < 0) _settingsIndex = _settingsItems.Count - 1;
 			AnnounceCurrentSetting();
 		}
-		// Right: next item
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+		// Down: next setting
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
 		{
 			if (_settingsItems.Count == 0) return;
 			_settingsIndex++;
 			if (_settingsIndex >= _settingsItems.Count) _settingsIndex = 0;
 			AnnounceCurrentSetting();
 		}
-		// Down: read current value (details)
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+		// Left: decrease slider / toggle off
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
 		{
-			if (_settingsIndex >= 0 && _settingsIndex < _settingsItems.Count)
-			{
-				string value = GetSettingValue(_settingsItems[_settingsIndex]);
-				AnnouncementService.Instance.Announce(string.IsNullOrEmpty(value) ? _settingsItems[_settingsIndex].Label : value);
-			}
+			AdjustCurrentSetting(-1);
 		}
-		// Enter: activate button, toggle, or enter slider adjust mode
+		// Right: increase slider / toggle on
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
+		{
+			AdjustCurrentSetting(1);
+		}
+		// Enter: activate button, toggle
 		else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
 		{
 			ActivateCurrentSetting();
 		}
-		// Backspace: exit settings (handled by parent via TryCloseDialog path)
+		// Backspace: exit settings
 		else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East))
 		{
 			_settingsMode = false;
-			_sliderAdjustMode = false;
-			_settingsItems.Clear();
+				_settingsItems.Clear();
 			Deactivate();
 		}
 	}
@@ -1009,19 +1132,36 @@ public class DialogHandler : IScreenNavigator
 					if ((Object)(object)item.Button != (Object)null)
 					{
 						AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("dialog_activating", item.Label));
-						// Try onClick first, fall back to mouse simulation
-						if (!UIHelper.ClickButton(item.Button))
-							UIHelper.SimulateMouseClick(((Component)item.Button).gameObject);
+						UIHelper.ActivateButton(item.Button);
 						// Schedule rescan to pick up any UI changes
 						_needsRescan = true;
 						_rescanDelay = Time.time + 1.0f;
 					}
 					break;
 				case SettingsItemType.Slider:
-					// Enter on slider enters adjust mode (Left/Right to change, Enter/Backspace to exit)
-					_sliderAdjustMode = true;
+					// Read current value — use Left/Right to adjust
 					string value = GetSettingValue(item);
-					AnnouncementService.Instance.Announce(Loc.Get("settings_adjusting", item.Label, value));
+					AnnouncementService.Instance.Announce(
+						$"{item.Label}, {value}. " + Loc.Get("settings_use_arrows"));
+					break;
+				case SettingsItemType.ActionComponent:
+					if ((Object)(object)item.ActionTarget != (Object)null && !string.IsNullOrEmpty(item.ActionMethod))
+					{
+						AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("dialog_activating", item.Label));
+						try
+						{
+							var methodInfo = item.ActionTarget.GetType().GetMethod(item.ActionMethod,
+								System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+							methodInfo?.Invoke(item.ActionTarget, null);
+						}
+						catch (Exception ex2)
+						{
+							DebugLogger.Log(LogCategory.Handler, "DialogHandler",
+								$"ActionComponent invoke failed: {ex2.Message}");
+						}
+						_needsRescan = true;
+						_rescanDelay = Time.time + 1.0f;
+					}
 					break;
 			}
 		}
@@ -1032,6 +1172,110 @@ public class DialogHandler : IScreenNavigator
 	}
 
 	// --- Text Input Mode ---
+
+	/// <summary>Gets a descriptive label for an input field from surrounding context text.</summary>
+	private string GetInputFieldLabel(TMP_InputField field)
+	{
+		// Strategy 1: Search the entire scan root for Title/Body text elements
+		// This is the most reliable approach for dialog overlays
+		try
+		{
+			GameObject searchRoot = _scanRoot;
+			if ((Object)(object)searchRoot == (Object)null)
+			{
+				// Fall back to walking up from the field
+				Transform p = ((Component)field).transform;
+				for (int d = 0; d < 6 && p != null; d++) p = p.parent;
+				if (p != null) searchRoot = p.gameObject;
+			}
+			if ((Object)(object)searchRoot != (Object)null)
+			{
+				Il2CppArrayBase<TMP_Text> allTexts = searchRoot.GetComponentsInChildren<TMP_Text>(false);
+				if (allTexts != null)
+				{
+					// First pass: look for Body text (more descriptive, e.g. "What should we call you?")
+					for (int i = 0; i < allTexts.Count; i++)
+					{
+						TMP_Text tmp = allTexts[i];
+						if ((Object)(object)tmp == (Object)null) continue;
+						string goName = ((Object)((Component)tmp).gameObject).name;
+						if (goName.Contains("Body", StringComparison.OrdinalIgnoreCase) ||
+						    goName.Contains("PopUpBody", StringComparison.OrdinalIgnoreCase))
+						{
+							string text = UIHelper.StripRichText((tmp.text ?? "").Trim());
+							if (text.Length >= 3 && !text.Contains("{Missing"))
+								return text;
+						}
+					}
+					// Second pass: look for Title text
+					for (int i = 0; i < allTexts.Count; i++)
+					{
+						TMP_Text tmp = allTexts[i];
+						if ((Object)(object)tmp == (Object)null) continue;
+						string goName = ((Object)((Component)tmp).gameObject).name;
+						if (goName.Contains("Title", StringComparison.OrdinalIgnoreCase) ||
+						    goName.Contains("Header", StringComparison.OrdinalIgnoreCase))
+						{
+							string text = UIHelper.StripRichText((tmp.text ?? "").Trim());
+							if (text.Length >= 3 && !text.Contains("{Missing"))
+								return text;
+						}
+					}
+				}
+			}
+		}
+		catch { }
+
+		// Strategy 2: Walk up hierarchy looking for text siblings (original approach)
+		try
+		{
+			Transform parent = ((Component)field).transform.parent;
+			for (int depth = 0; depth < 3 && parent != null; depth++)
+			{
+				for (int i = 0; i < parent.childCount; i++)
+				{
+					Transform sibling = parent.GetChild(i);
+					if (sibling == ((Component)field).transform) continue;
+					TMP_Text directTmp = sibling.GetComponent<TMP_Text>();
+					if ((Object)(object)directTmp != (Object)null)
+					{
+						string goName = ((Object)((Component)directTmp).gameObject).name;
+						if (goName.Contains("Title", StringComparison.OrdinalIgnoreCase) ||
+							goName.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
+							goName.Contains("Body", StringComparison.OrdinalIgnoreCase))
+						{
+							string text = UIHelper.StripRichText((directTmp.text ?? "").Trim());
+							if (text.Length >= 3 && !text.Contains("{Missing"))
+								return text;
+						}
+					}
+				}
+				parent = parent.parent;
+			}
+		}
+		catch { }
+
+		// Try placeholder text
+		try
+		{
+			if (field.placeholder != null)
+			{
+				string placeholder = UIHelper.StripRichText(((TMP_Text)field.placeholder).text);
+				if (!string.IsNullOrEmpty(placeholder) && placeholder.Length > 3)
+					return placeholder;
+			}
+		}
+		catch { }
+
+		// Fall back to GO name
+		try
+		{
+			return UIHelper.CleanGameObjectName(((Object)((Component)field).gameObject).name);
+		}
+		catch { }
+
+		return Loc.Get("dialog_text_field");
+	}
 
 	/// <summary>Activates the input field and enters text input mode.</summary>
 	private void EnterTextInputMode(string fieldName)
@@ -1050,6 +1294,8 @@ public class DialogHandler : IScreenNavigator
 		_lastInputText = "";
 		try { _lastInputText = _activeInputField.text ?? ""; } catch { }
 		AnnouncementService.Instance.Announce(Loc.Get("dialog_editing", fieldName));
+		if (!string.IsNullOrEmpty(_lastInputText))
+			AnnouncementService.Instance.Announce(Loc.Get("login_field_current", _lastInputText), AnnouncementPriority.Normal);
 		DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Entered text input mode: " + fieldName);
 	}
 
@@ -1083,6 +1329,9 @@ public class DialogHandler : IScreenNavigator
 			DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Exited text input mode. Text: " + finalText);
 			// Block input briefly so Enter doesn't activate a button
 			_inputBlockUntil = Time.time + 0.3f;
+			// Schedule rescan — buttons may have changed interactable state after text was entered
+			_needsRescan = true;
+			_rescanDelay = Time.time + 0.5f;
 			return;
 		}
 
@@ -1096,6 +1345,22 @@ public class DialogHandler : IScreenNavigator
 			return;
 		}
 
+		// Up/Down: read full field content (AccessibleArena pattern)
+		if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsKeyDown(SDLInput.Key.Down))
+		{
+			try
+			{
+				string content = _activeInputField.text ?? "";
+				if (string.IsNullOrEmpty(content))
+					AnnouncementService.Instance.Announce(Loc.Get("login_field_empty"), AnnouncementPriority.Immediate);
+				else
+					AnnouncementService.Instance.Announce(content, AnnouncementPriority.Immediate);
+				try { _activeInputField.ActivateInputField(); } catch { }
+			}
+			catch { }
+			return;
+		}
+
 		// Track text changes and speak new characters
 		try
 		{
@@ -1106,7 +1371,7 @@ public class DialogHandler : IScreenNavigator
 				{
 					// Characters added — speak the new portion
 					string added = currentText.Substring(_lastInputText.Length);
-					AnnouncementService.Instance.Announce(added);
+					AnnouncementService.Instance.Announce(added, AnnouncementPriority.Immediate);
 				}
 				else if (currentText.Length < _lastInputText.Length)
 				{
@@ -1126,31 +1391,31 @@ public class DialogHandler : IScreenNavigator
 		// Block input briefly after reset to prevent double-activation
 		if (Time.time < _inputBlockUntil) return;
 
-		// 1. Button Navigation (Left/Right) with hold-to-repeat
-		Action moveLeft = () => {
+		// 1. Button Navigation (Up/Down) with hold-to-repeat
+		Action movePrev = () => {
 			CleanupDestroyedButtons();
 			if (_buttons.Count == 0) return;
 			_focusIndex = (_focusIndex - 1 + _buttons.Count) % _buttons.Count;
 			_textReadIndex = -1;
 			AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
 		};
-		Action moveRight = () => {
+		Action moveNext = () => {
 			CleanupDestroyedButtons();
 			if (_buttons.Count == 0) return;
 			_focusIndex = (_focusIndex + 1) % _buttons.Count;
 			_textReadIndex = -1;
 			AnnouncementService.Instance.Announce(Loc.Get("dialog_button_focus", GetLabel(_focusIndex), _focusIndex + 1, _buttons.Count));
 		};
-		if (_holdRepeater.Check(SDLInput.Key.Left, moveLeft)) { }
-		else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) moveLeft();
-		else if (_holdRepeater.Check(SDLInput.Key.Right, moveRight)) { }
-		else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) moveRight();
-		// 2. Details (Down reads next, Up reads previous screen text line)
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+		if (_holdRepeater.Check(SDLInput.Key.Up, movePrev)) { }
+		else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp)) movePrev();
+		else if (_holdRepeater.Check(SDLInput.Key.Down, moveNext)) { }
+		else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown)) moveNext();
+		// 2. Details (Right reads next, Left reads previous screen text line)
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
 		{
 			ReadNextScreenText();
 		}
-		else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
+		else if (SDLInput.IsKeyDown(SDLInput.Key.Left) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
 		{
 			ReadPreviousScreenText();
 		}
@@ -1191,7 +1456,7 @@ public class DialogHandler : IScreenNavigator
 				    goName.Equals("btn_close", StringComparison.OrdinalIgnoreCase) ||
 				    goName.Equals("CloseButton", StringComparison.OrdinalIgnoreCase))
 				{
-					UIHelper.ClickButton(_buttons[i]);
+					UIHelper.ActivateButton(_buttons[i]);
 					DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Closed dialog via: " + goName);
 					Deactivate();
 					return;
@@ -1233,7 +1498,7 @@ public class DialogHandler : IScreenNavigator
 				}
 				if (fallback != null)
 				{
-					UIHelper.ClickButton(fallback);
+					UIHelper.ActivateButton(fallback);
 					DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Closed via back button: " + ((Object)((Component)fallback).gameObject).name);
 					Deactivate();
 					return;
@@ -1289,10 +1554,16 @@ public class DialogHandler : IScreenNavigator
 			return;
 		}
 
+		// Null button (shouldn't happen except for input field entries handled above)
+		if ((Object)(object)button == (Object)null)
+		{
+			DebugLogger.Log(LogCategory.Handler, "DialogHandler", "Null button at index " + _focusIndex);
+			return;
+		}
+
 		DebugLogger.LogInput("Enter", "Clicking: " + label);
 		AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("dialog_activating", label));
-		if (!UIHelper.ClickButton(button))
-			UIHelper.SimulateMouseClick(((Component)button).gameObject);
+		UIHelper.ActivateButton(button);
 
 		// Schedule rescan after 0.8s
 		_needsRescan = true;
@@ -1578,18 +1849,34 @@ public class DialogHandler : IScreenNavigator
 	{
 		for (int i = _buttons.Count - 1; i >= 0; i--)
 		{
+			// Skip null entries — these are input field placeholders
+			if (i == _inputFieldButtonIndex && _buttons[i] == null)
+			{
+				// Check if the input field itself is still valid
+				if ((Object)(object)_activeInputField == (Object)null ||
+					!((Component)_activeInputField).gameObject.activeInHierarchy)
+				{
+					_buttons.RemoveAt(i);
+					if (i < _labels.Count) _labels.RemoveAt(i);
+					_inputFieldButtonIndex = -1;
+				}
+				continue;
+			}
 			try
 			{
 				if (_buttons[i] == null || !_buttons[i].gameObject.activeInHierarchy)
 				{
 					_buttons.RemoveAt(i);
 					if (i < _labels.Count) _labels.RemoveAt(i);
+					// Adjust input field index if it shifted
+					if (_inputFieldButtonIndex > i) _inputFieldButtonIndex--;
 				}
 			}
 			catch
 			{
 				_buttons.RemoveAt(i);
 				if (i < _labels.Count) _labels.RemoveAt(i);
+				if (_inputFieldButtonIndex > i) _inputFieldButtonIndex--;
 			}
 		}
 		if (_focusIndex >= _buttons.Count)

@@ -495,6 +495,19 @@ public static class SDLInput
 		return _lastKeyStates.TryGetValue(key, out value) && value && _keyStates.TryGetValue(key, out value2) && !value2;
 	}
 
+	/// <summary>Returns true if any key was pressed this frame (not held from previous frame).</summary>
+	public static bool AnyKeyDown()
+	{
+		foreach (var kvp in _keyStates)
+		{
+			if (!kvp.Value) continue;
+			bool wasDown;
+			if (!_lastKeyStates.TryGetValue(kvp.Key, out wasDown) || !wasDown)
+				return true;
+		}
+		return false;
+	}
+
 	public static bool IsButtonDown(GamepadButton button)
 	{
 		if (_gamepad == IntPtr.Zero)

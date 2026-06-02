@@ -10,6 +10,8 @@ namespace SnapAccess;
 
 /// <summary>
 /// Specialized handler for the Missions screen.
+/// Two-level navigation: categories → missions.
+/// Follows AccessibleArena pattern: title + status in browse, full details on Right.
 /// </summary>
 public class MissionsHandler : IScreenNavigator
 {
@@ -20,6 +22,7 @@ public class MissionsHandler : IScreenNavigator
         public string Progress;
         public string Goal;
         public string Reward;
+        public bool IsComplete;
         public Button ClaimButton;
     }
 
@@ -27,6 +30,7 @@ public class MissionsHandler : IScreenNavigator
     {
         public string Name;
         public List<MissionInfo> Missions = new List<MissionInfo>();
+        public int CompletedCount;
     }
 
     private readonly List<MissionCategory> _categories = new List<MissionCategory>();
@@ -34,7 +38,7 @@ public class MissionsHandler : IScreenNavigator
     private int _missionIndex = 0;
     private int _menuLevel = 0; // 0=Categories, 1=Missions
     private bool _isActive = false;
-    private bool _activated = false; // Gate: only scan when explicitly activated by MainMenuHandler
+    private bool _activated = false;
     private float _lastScanTime = 0f;
     private readonly KeyHoldRepeater _holdRepeater = new KeyHoldRepeater();
 
@@ -44,13 +48,11 @@ public class MissionsHandler : IScreenNavigator
 
     /// <summary>
     /// Called by MainMenuHandler when user navigates to the Missions category.
-    /// Without this gate, MissionsSection GameObjects (always present on play screen)
-    /// would cause this navigator to preempt MainMenuHandler permanently.
     /// </summary>
     public void Activate()
     {
         _activated = true;
-        _lastScanTime = 0f; // Force immediate scan
+        _lastScanTime = 0f;
     }
 
     public void Update()
@@ -70,7 +72,6 @@ public class MissionsHandler : IScreenNavigator
         if (Time.time - _lastScanTime < 1.5f) return _isActive;
         _lastScanTime = Time.time;
 
-        // Try to find the missions container
         GameObject root = GameObject.Find("MissionsSection") ?? GameObject.Find("Mission_Landscape");
         if (root == null || !root.activeInHierarchy) return false;
 
@@ -80,26 +81,38 @@ public class MissionsHandler : IScreenNavigator
         GameObject dailyRoot = GameObject.Find("DailyMissionsPanel");
         if (dailyRoot != null && dailyRoot.activeInHierarchy)
         {
-            var cat = new MissionCategory { Name = "Daily Missions" };
+            var cat = new MissionCategory { Name = Loc.Get("ms_cat_daily") };
             cat.Missions = ScanTiles(dailyRoot);
-            if (cat.Missions.Count > 0) _categories.Add(cat);
+            if (cat.Missions.Count > 0)
+            {
+                cat.CompletedCount = CountCompleted(cat.Missions);
+                _categories.Add(cat);
+            }
         }
 
         // 2. Season Pass Missions
         GameObject seasonRoot = GameObject.Find("SeasonPassMissionPanel");
         if (seasonRoot != null && seasonRoot.activeInHierarchy)
         {
-            var cat = new MissionCategory { Name = "Season Missions" };
+            var cat = new MissionCategory { Name = Loc.Get("ms_cat_season") };
             cat.Missions = ScanTiles(seasonRoot);
-            if (cat.Missions.Count > 0) _categories.Add(cat);
+            if (cat.Missions.Count > 0)
+            {
+                cat.CompletedCount = CountCompleted(cat.Missions);
+                _categories.Add(cat);
+            }
         }
 
-        // Fallback
+        // Fallback: scan all missions under root
         if (_categories.Count == 0)
         {
-            var cat = new MissionCategory { Name = "All Missions" };
+            var cat = new MissionCategory { Name = Loc.Get("ms_cat_all") };
             cat.Missions = ScanTiles(root);
-            if (cat.Missions.Count > 0) _categories.Add(cat);
+            if (cat.Missions.Count > 0)
+            {
+                cat.CompletedCount = CountCompleted(cat.Missions);
+                _categories.Add(cat);
+            }
         }
 
         return _categories.Count > 0;
@@ -108,7 +121,7 @@ public class MissionsHandler : IScreenNavigator
     private List<MissionInfo> ScanTiles(GameObject root)
     {
         var list = new List<MissionInfo>();
-        Button[] buttons = root.GetComponentsInChildren<Button>(true);
+        Il2CppArrayBase<Button> buttons = root.GetComponentsInChildren<Button>(true);
         foreach (var btn in buttons)
         {
             if (btn == null || !btn.gameObject.activeInHierarchy) continue;
@@ -127,7 +140,7 @@ public class MissionsHandler : IScreenNavigator
     private MissionInfo ReadMissionTile(GameObject tile)
     {
         var info = new MissionInfo();
-        TMP_Text[] texts = tile.GetComponentsInChildren<TMP_Text>(true);
+        Il2CppArrayBase<TMP_Text> texts = tile.GetComponentsInChildren<TMP_Text>(true);
         foreach (var t in texts)
         {
             string n = t.gameObject.name.ToLower();
@@ -141,108 +154,203 @@ public class MissionsHandler : IScreenNavigator
             else if (n.Contains("credit")) info.Reward += v + " credits ";
             else if (n.Contains("battlepass")) info.Reward += v + " XP ";
         }
-        return string.IsNullOrEmpty(info.Title) ? null : info;
+        if (string.IsNullOrEmpty(info.Title)) return null;
+
+        // Determine completion status
+        try
+        {
+            if (!string.IsNullOrEmpty(info.Progress) && !string.IsNullOrEmpty(info.Goal))
+                info.IsComplete = info.Progress == info.Goal;
+        }
+        catch { }
+
+        return info;
+    }
+
+    private int CountCompleted(List<MissionInfo> missions)
+    {
+        int count = 0;
+        foreach (var m in missions)
+            if (m.IsComplete) count++;
+        return count;
     }
 
     private void ProcessInput()
     {
-        if (_holdRepeater.Check(SDLInput.Key.Left, MovePrev)) { }
-        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MovePrev();
-        else if (_holdRepeater.Check(SDLInput.Key.Right, MoveNext)) { }
-        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveNext();
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown)) ReadDetails();
+        if (_holdRepeater.Check(SDLInput.Key.Up, MovePrev)) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp)) MovePrev();
+        else if (_holdRepeater.Check(SDLInput.Key.Down, MoveNext)) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown)) MoveNext();
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) ReadDetails();
         else if (SDLInput.IsKeyDown(SDLInput.Key.Home)) JumpToFirst();
         else if (SDLInput.IsKeyDown(SDLInput.Key.End)) JumpToLast();
         else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South)) Enter();
         else if (SDLInput.IsKeyDown(SDLInput.Key.Backspace) || SDLInput.IsKeyDown(SDLInput.Key.Escape) || SDLInput.IsButtonDown(SDLInput.GamepadButton.East)) Back();
+        else if (SDLInput.IsKeyDown(SDLInput.Key.H)) AnnounceContext();
     }
 
     private void JumpToFirst()
     {
         if (_menuLevel == 0) { _catIndex = 0; AnnounceCat(); }
-        else if (_categories[_catIndex].Missions.Count > 0) { _missionIndex = 0; AnnounceMissionTitle(); }
+        else if (_categories[_catIndex].Missions.Count > 0) { _missionIndex = 0; AnnounceMission(); }
     }
 
     private void JumpToLast()
     {
         if (_menuLevel == 0 && _categories.Count > 0) { _catIndex = _categories.Count - 1; AnnounceCat(); }
-        else if (_categories[_catIndex].Missions.Count > 0) { _missionIndex = _categories[_catIndex].Missions.Count - 1; AnnounceMissionTitle(); }
+        else if (_categories[_catIndex].Missions.Count > 0)
+        {
+            _missionIndex = _categories[_catIndex].Missions.Count - 1;
+            AnnounceMission();
+        }
     }
 
     private void MovePrev()
     {
         if (_menuLevel == 0) { _catIndex = (_catIndex - 1 + _categories.Count) % _categories.Count; AnnounceCat(); }
-        else { _missionIndex = (_missionIndex - 1 + _categories[_catIndex].Missions.Count) % _categories[_catIndex].Missions.Count; AnnounceMissionTitle(); }
+        else
+        {
+            _missionIndex = (_missionIndex - 1 + _categories[_catIndex].Missions.Count) % _categories[_catIndex].Missions.Count;
+            AnnounceMission();
+        }
     }
 
     private void MoveNext()
     {
         if (_menuLevel == 0) { _catIndex = (_catIndex + 1) % _categories.Count; AnnounceCat(); }
-        else { _missionIndex = (_missionIndex + 1) % _categories[_catIndex].Missions.Count; AnnounceMissionTitle(); }
+        else
+        {
+            _missionIndex = (_missionIndex + 1) % _categories[_catIndex].Missions.Count;
+            AnnounceMission();
+        }
     }
 
     private void ReadDetails()
     {
         if (_menuLevel == 0)
         {
-            if (_catIndex >= 0 && _catIndex < _categories.Count)
-                AnnouncementService.Instance.Announce(Loc.Get("ms_category_count", _categories[_catIndex].Missions.Count.ToString()));
+            // Right on category: read summary with completion info
+            if (_catIndex < 0 || _catIndex >= _categories.Count) return;
+            var cat = _categories[_catIndex];
+            string summary = cat.Name + ". " + cat.Missions.Count + " missions, " +
+                cat.CompletedCount + " complete.";
+            AnnouncementService.Instance.Announce(summary);
         }
         else
         {
-            // Read full mission details on Down
-            AnnounceMission();
+            // Right on mission: read full details
+            AnnounceMissionFull();
         }
     }
 
     private void Enter()
     {
-        if (_menuLevel == 0) { _menuLevel = 1; _missionIndex = 0; AnnounceMissionTitle(); }
+        if (_menuLevel == 0)
+        {
+            _menuLevel = 1;
+            _missionIndex = 0;
+            var cat = _categories[_catIndex];
+            AnnouncementService.Instance.Announce(
+                cat.Name + ", " + cat.Missions.Count + " missions. " +
+                Loc.Get("ms_nav_hint"), AnnouncementPriority.High);
+            AnnounceMission();
+        }
         else
         {
             var m = _categories[_catIndex].Missions[_missionIndex];
-            bool isComplete = false;
-            try
+            if (m.IsComplete)
             {
-                isComplete = !string.IsNullOrEmpty(m.Progress) && !string.IsNullOrEmpty(m.Goal) && m.Progress == m.Goal;
-            }
-            catch { }
-            if (isComplete)
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("ms_claiming", m.Title));
+                UIHelper.ActivateButton(m.ClaimButton);
+                // Force rescan after claiming
+                _lastScanTime = 0f;
+            }
             else
+            {
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("ms_opening", m.Title));
-            UIHelper.ClickButtonWithFallback(m.ClaimButton);
-            // Deactivate so DialogHandler can handle any popup that appears
+                UIHelper.ActivateButton(m.ClaimButton);
+            }
             _isActive = false;
         }
     }
 
     private void Back()
     {
-        if (_menuLevel == 1) { _menuLevel = 0; AnnounceCat(); }
-        else { _activated = false; _isActive = false; }
+        if (_menuLevel == 1)
+        {
+            _menuLevel = 0;
+            AnnouncementService.Instance.Announce(Loc.Get("ms_back_to_categories"));
+            AnnounceCat();
+        }
+        else
+        {
+            _activated = false;
+            _isActive = false;
+        }
     }
 
-    private void AnnounceCat() => AnnouncementService.Instance.Announce(_categories[_catIndex].Name + ", " + _categories[_catIndex].Missions.Count + " missions.");
-
-    /// <summary>Short announcement when navigating missions with Left/Right.</summary>
-    private void AnnounceMissionTitle()
+    private void AnnounceCat()
     {
-        var m = _categories[_catIndex].Missions[_missionIndex];
-        AnnouncementService.Instance.Announce(m.Title + ", " + (_missionIndex + 1) + " of " + _categories[_catIndex].Missions.Count);
+        if (_catIndex < 0 || _catIndex >= _categories.Count) return;
+        var cat = _categories[_catIndex];
+        string msg = cat.Name + ", " + cat.Missions.Count + " missions";
+        if (cat.CompletedCount > 0)
+            msg += ", " + cat.CompletedCount + " complete";
+        msg += ". " + (_catIndex + 1) + " of " + _categories.Count;
+        AnnouncementService.Instance.Announce(msg);
     }
 
-    /// <summary>Full details when pressing Down.</summary>
+    /// <summary>Browse announcement: title + progress status + position.</summary>
     private void AnnounceMission()
     {
-        var m = _categories[_catIndex].Missions[_missionIndex];
-        AnnouncementService.Instance.Announce(m.Title + ". " + m.Desc + ". Progress " + m.Progress + " of " + m.Goal + ". Reward: " + m.Reward);
+        if (_catIndex < 0 || _catIndex >= _categories.Count) return;
+        var missions = _categories[_catIndex].Missions;
+        if (_missionIndex < 0 || _missionIndex >= missions.Count) return;
+
+        var m = missions[_missionIndex];
+        string status = GetMissionStatus(m);
+        string msg = m.Title + ", " + status + ", " + (_missionIndex + 1) + " of " + missions.Count;
+        AnnouncementService.Instance.Announce(msg);
+    }
+
+    /// <summary>Full details on Right key.</summary>
+    private void AnnounceMissionFull()
+    {
+        if (_catIndex < 0 || _catIndex >= _categories.Count) return;
+        var missions = _categories[_catIndex].Missions;
+        if (_missionIndex < 0 || _missionIndex >= missions.Count) return;
+
+        var m = missions[_missionIndex];
+        var parts = new List<string>();
+        parts.Add(m.Title);
+        if (!string.IsNullOrEmpty(m.Desc))
+            parts.Add(m.Desc);
+        parts.Add(Loc.Get("ms_progress_detail", m.Progress ?? "0", m.Goal ?? "?"));
+        if (m.IsComplete)
+            parts.Add(Loc.Get("ms_status_complete"));
+        if (!string.IsNullOrEmpty(m.Reward))
+            parts.Add(Loc.Get("ms_reward", m.Reward.Trim()));
+        if (m.IsComplete)
+            parts.Add(Loc.Get("ms_claim_hint"));
+
+        AnnouncementService.Instance.Announce(string.Join(". ", parts));
+    }
+
+    private string GetMissionStatus(MissionInfo m)
+    {
+        if (m.IsComplete) return Loc.Get("ms_complete");
+        if (!string.IsNullOrEmpty(m.Progress) && !string.IsNullOrEmpty(m.Goal))
+            return m.Progress + "/" + m.Goal;
+        return Loc.Get("ms_incomplete");
     }
 
     public void AnnounceContext()
     {
         AnnouncementService.Instance.Announce(Loc.Get("ms_help"), AnnouncementPriority.High);
-        AnnounceCat();
+        if (_menuLevel == 0)
+            AnnounceCat();
+        else
+            AnnounceMission();
     }
 
     public void Deactivate()

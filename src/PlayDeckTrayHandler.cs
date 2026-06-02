@@ -59,7 +59,7 @@ public class PlayDeckTrayHandler : IScreenNavigator
         _equipButton = null;
         _closeButton = null;
 
-        Button[] buttons = root.GetComponentsInChildren<Button>(true);
+        Il2CppArrayBase<Button> buttons = root.GetComponentsInChildren<Button>(true);
         foreach (var btn in buttons)
         {
             if (btn == null || !btn.gameObject.activeInHierarchy) continue;
@@ -101,11 +101,11 @@ public class PlayDeckTrayHandler : IScreenNavigator
 
     private void ProcessInput()
     {
-        if (_holdRepeater.Check(SDLInput.Key.Left, () => MoveFocus(-1))) { }
-        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MoveFocus(-1);
-        else if (_holdRepeater.Check(SDLInput.Key.Right, () => MoveFocus(1))) { }
-        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveFocus(1);
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+        if (_holdRepeater.Check(SDLInput.Key.Up, () => MoveFocus(-1))) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp)) MoveFocus(-1);
+        else if (_holdRepeater.Check(SDLInput.Key.Down, () => MoveFocus(1))) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown)) MoveFocus(1);
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
         {
             // Read deck details
             if (_focusIndex >= 0 && _focusIndex < _decks.Count)
@@ -155,13 +155,13 @@ public class PlayDeckTrayHandler : IScreenNavigator
         if (_focusIndex < 0 || _focusIndex >= _decks.Count) return;
 
         AnnouncementService.Instance.AnnounceInterrupt("Selecting " + _decks[_focusIndex].Name);
-        UIHelper.ClickButton(_decks[_focusIndex].Button);
+        UIHelper.ActivateButton(_decks[_focusIndex].Button);
 
         // After selecting, we almost always want to Equip
         if (_equipButton != null && _equipButton.gameObject.activeInHierarchy)
         {
             AnnouncementService.Instance.Announce("Equipping...", AnnouncementPriority.Low);
-            UIHelper.ClickButton(_equipButton);
+            UIHelper.ActivateButton(_equipButton);
             Close();
         }
     }
@@ -171,13 +171,13 @@ public class PlayDeckTrayHandler : IScreenNavigator
         if (_focusIndex >= 0 && _focusIndex < _decks.Count)
         {
             // First select the deck
-            UIHelper.ClickButton(_decks[_focusIndex].Button);
+            UIHelper.ActivateButton(_decks[_focusIndex].Button);
         }
 
         if (_editButton != null && _editButton.gameObject.activeInHierarchy)
         {
             AnnouncementService.Instance.AnnounceInterrupt("Editing " + (_focusIndex >= 0 && _focusIndex < _decks.Count ? _decks[_focusIndex].Name : "deck"));
-            UIHelper.ClickButton(_editButton);
+            UIHelper.ActivateButton(_editButton);
         }
         else
         {
@@ -187,7 +187,7 @@ public class PlayDeckTrayHandler : IScreenNavigator
 
     public void Close()
     {
-        if (_closeButton != null) UIHelper.ClickButton(_closeButton);
+        if (_closeButton != null) UIHelper.ActivateButton(_closeButton);
         else UIHelper.SimulateKeyPress(SDLInput.Key.Escape);
         _isActive = false;
     }

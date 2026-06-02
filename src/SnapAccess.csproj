@@ -14,6 +14,9 @@
   <ItemGroup>
     <Compile Remove="decompiled_SnapAccess\**" />
     <Compile Remove="templates\**" />
+    <Compile Remove="NewsHandler.cs" />
+    <Compile Remove="NotificationScanner.cs" />
+    <Compile Remove="ShortcutRegistry.cs" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -133,6 +136,10 @@
     </Reference>
     <Reference Include="Il2CppApp.Event">
       <HintPath>$(Il2CppAssemblies)\Il2CppApp.Event.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppMAScripts">
+      <HintPath>$(Il2CppAssemblies)\Il2CppMAScripts.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Il2CppApp.Collection">

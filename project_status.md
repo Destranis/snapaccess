@@ -40,9 +40,23 @@
 
 ## Current Phase
 
-**Phase:** Feature Completion (v0.5.0) — All major features implemented
-**Currently working on:** Testing remaining features
-**Completed (2026-05-29):**
+**Phase:** Feature Completion (v0.6.0) — MTGA-inspired features added
+**Currently working on:** Testing all new v0.6 features
+**Completed (2026-05-29, v0.6):**
+  - **Zone/Card Tracking (Z key):** Press Z during battle to hear cards in hand, on board, in deck, destroyed, banished. Uses PlayerController zone controllers via GameView.
+  - **Card Text Cache:** Ability text cached by card name — avoids expensive Unity transform lookups on repeat reads.
+  - **Snap Detection:** Harmony patch on StakesView.ShowRaiseStakesForNextTurn — announces when opponent or you snap with new cube value.
+  - **Richer Season/Rank Info:** Play screen reads RankView component for rank number + trophies, scans for tier name. Localized through Loc keys.
+  - **Shortcut Registry (new: ShortcutRegistry.cs):** Centralized key binding system with default keyboard + gamepad mappings. Supports JSON override file (UserData/SnapAccess_Keys.json).
+  - **Social/Inbox Notifications (new: NotificationScanner.cs):** N key on Play screen reads all active NotificationBadge components, walks parent hierarchy for context.
+  - **Card Collection Stats:** I key in collection view counts total items across all sections.
+  - **Matchmaking Status:** Harmony patches on MatchLoadViewController.OnMatchmakingStarting/OnMatchmakingMatchFound — announces "Searching..." and "Match found!"
+  - **Reward Tracking:** Harmony patch on PostGameRewardView.Initialize — announces reward description text.
+  - **News Screen Handler (new: NewsHandler.cs):** Dedicated navigator (priority 450) for NewsFeedView. Reads InboxMessageContentHandler topics, supports Left/Right navigation, Enter to open, Home/End.
+  - New DLL references: Il2CppApp.News, Il2CppApp.NewsFeed, Il2CppSecondDinner.CubeProfile
+  - New Loc keys: ~20 new keys for zones, snap, rank, matchmaking, news, rewards, notifications, collection
+  - Build succeeds with 0 errors, 0 warnings, deployed to game
+**Completed (2026-05-29, v0.5):**
   - **Navigator Architecture (v0.3):**
     - Decompiled AccessibleArena.dll (MTGA accessibility mod, 143 files) and analyzed its architecture
     - Created NavigatorManager with priority-based activation/preemption
@@ -151,6 +165,16 @@
 - **Input Field Helper** - Character-by-character announcements in text input fields
 - **Update Checker** - GitHub release version checker (framework ready)
 - **Screen Reader (Tolk)** - Bridge to NVDA/JAWS
+- **Zone Tracking** - Z key during battle: hand/board/deck/graveyard/banished card counts
+- **Card Text Cache** - Cached ability text by card name for instant repeat lookups
+- **Snap Detection** - Auto-announces opponent/player snap with new cube value
+- **Richer Rank Info** - RankView + tier name + trophies on Play screen
+- **Shortcut Registry** - Centralized key bindings with JSON override support
+- **Notification Scanner** - N key reads active notification badges
+- **Collection Stats** - I key in collection: total categories and items
+- **Matchmaking Announcements** - Auto-announces searching and match found
+- **Reward Announcements** - Auto-announces post-game rewards
+- **News Handler** - Dedicated navigator for News screen with article browsing
 
 ## Pending Tests
 
@@ -215,43 +239,62 @@
 
 ## Key Bindings (Mod)
 
-### Keyboard
+### Keyboard — Menus (all non-battlefield screens)
+- Arrow Up/Down: Navigate items (with hold-to-repeat)
+- Arrow Right: Read details / drill down
+- Arrow Left: Read previous (in dialogs)
+- Enter: Select / Confirm / Edit field
+- Escape: Exit edit mode / Cancel
+- Backspace: Go back / Close
+- Tab: Switch area (DeckBuilder: deck/collection, Shop: tabs)
+- Home/End: Jump to first/last item
+- A-Z: Letter jump (collection, deck builder)
 - F1: Help / context announcement
 - F3: Repeat last announcement
+- F4: Mod settings
 - F12: Toggle debug mode
-- Arrow Left/Right: Navigate (with hold-to-repeat in all handlers)
-- Arrow Up: Switch to Locations area (battlefield)
-- Arrow Down: Details / Switch to Hand area (battlefield)
-- Enter: Select / Confirm / Play card
-- Backspace: Go back / Close
-- Escape: Cancel card selection
-- Space: Advance tutorial (click center screen)
-- Tab: Switch area (DeckBuilder: deck/collection)
-- Home: Jump to first item in list
-- End: Jump to last item in list
-- A-Z: Letter jump (collection, deck builder)
-- E: End turn (battlefield) / Edit deck (deck tray)
+
+### Keyboard — Battlefield (unchanged)
+- Arrow Left/Right: Navigate hand cards / locations
+- Arrow Up: Switch to Locations area
+- Arrow Down: Switch to Hand area / Details
+- Enter: Play card to location
+- E: End turn
+- 1/2/3: Quick-play current card to location 1/2/3
 - I: Game info (hand count, location count)
-- O: Open/close game log
-- S: Silence all speech / Save (DeckBuilder)
+- S: Silence all speech
 - D: Announce drawn cards (deferred)
 - W: Timer (time remaining in turn)
-- 1/2/3: Quick-play current card to location 1/2/3
+- O: Open/close game log
+- Space: Advance tutorial
 
-### Gamepad
-- DPad Left/Right: Navigate
+### Keyboard — Login/Name Entry
+- Arrow Up/Down: Navigate elements
+- Enter: Activate button / Enter edit mode for text field
+- Escape: Exit edit mode
+- Up/Down while editing: Read full field content
+
+### Gamepad — Menus
+- DPad Up/Down: Navigate
+- DPad Right: Details
+- South (A/Cross): Confirm / Select
+- East (B/Circle): Cancel / Back
+- L1/R1: Tab switch
+
+### Gamepad — Battlefield (unchanged)
+- DPad Left/Right: Navigate hand/locations
 - DPad Up: Switch to Locations area
-- DPad Down: Details / Switch to Hand area
+- DPad Down: Switch to Hand area
 - South (A/Cross): Confirm / Select / Play
 - East (B/Circle): Cancel / Back
 - West (X/Square): Advance tutorial / Edit deck
 - North (Y/Triangle): Game info
 - Start: End turn
-- L1/R1: Tab switch / Navigate dialog buttons
 
 ## Notes for Next Session
 
-- All v0.5 features built and deployed, need in-game test pass
-- MTGA-inspired features added: TurnTimer integration, end turn guard, InputFieldHelper, UpdateChecker
-- Remaining feature ideas: richer season/rank info on play screen, news screen handler
-- New keys: W (timer), Home/End (first/last), A-Z (letter jump), Up (prev text in dialogs), F4 (settings)
+- v0.7: Navigation overhaul — all menus now use Up/Down arrows (battlefield unchanged)
+- Fixed post-tutorial card leak (BattlefieldHandler stops scanning after game over)
+- LoginHandler enhanced for name entry screen (edit field with Up/Down to read content)
+- Need in-game test pass for all navigation changes
+- Previous v0.5/v0.6 test items still pending
