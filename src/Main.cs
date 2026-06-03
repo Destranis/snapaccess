@@ -2,9 +2,8 @@ using System;
 using System.Collections;
 using MelonLoader;
 using UnityEngine;
-using Object = UnityEngine.Object;
 
-[assembly: MelonInfo(typeof(SnapAccess.Main), "SnapAccess", "0.5.0", "Amethyst & Gemini")]
+[assembly: MelonInfo(typeof(SnapAccess.Main), "SnapAccess", "0.6", "Amethyst & Gemini")]
 [assembly: MelonGame("Second Dinner", "SNAP")]
 
 namespace SnapAccess;
@@ -24,6 +23,7 @@ public class Main : MelonMod
     private GameLogNavigator _gameLog;
     private ModSettingsNavigator _modSettings;
     private InputFieldHelper _inputFieldHelper;
+    private float _nextTutorialCheck = 0f;
 
     /// <summary>
     /// Called by MelonLoader when the mod is first loaded.
@@ -59,15 +59,6 @@ public class Main : MelonMod
         _modSettings = new ModSettingsNavigator();
         _inputFieldHelper = new InputFieldHelper();
 
-        // Register navigators — NavigatorManager sorts by priority automatically
-        // Priority 1000: Login (consent/age gates)
-        // Priority 900: Battlefield (active match)
-        // Priority 700: PlayDeckTray (quick deck switcher overlay)
-        // Priority 650: DeckBuilder (deck editor)
-        // Priority 600: Missions (missions screen)
-        // Priority 550: FriendlyMatch (friendly battle screen)
-        // Priority 400: MainMenu (navigation hub)
-        // Priority 200: Dialog (catch-all popups)
         _navigatorManager.Register(new LoginHandler());
         _navigatorManager.Register(new BattlefieldHandler());
         _navigatorManager.Register(new PlayDeckTrayHandler());
@@ -113,13 +104,12 @@ public class Main : MelonMod
     /// </summary>
     public override void OnSceneWasLoaded(int buildIndex, string sceneName)
     {
-        MelonLogger.Msg($"Scene loaded: {sceneName}");
         DebugLogger.LogState($"Scene changed to: {sceneName}");
 
         if (!_gameReady)
         {
             _gameReady = true;
-            MelonLogger.Msg("Game engine reported ready.");
+            DebugLogger.LogState("Game engine reported ready.");
         }
 
         _navigatorManager.OnSceneChanged(sceneName);
@@ -183,11 +173,8 @@ public class Main : MelonMod
         return false;
     }
 
-    private float _nextTutorialCheck = 0f;
-
     /// <summary>
-    /// Identifies and disables tutorial overlays that capture mouse focus
-    /// but don't provide useful text to screen readers.
+    /// Identifies and disables tutorial overlays that capture mouse focus.
     /// </summary>
     private void DismissTutorialOverlays()
     {
@@ -204,26 +191,31 @@ public class Main : MelonMod
                     Transform child = tutContainer.transform.GetChild(i);
                     if (child == null || !child.gameObject.activeInHierarchy) continue;
 
-                    string childName = child.gameObject.name;
-                    if (childName.Contains("DirectTo") || childName.Contains("CaptureInput"))
+                    string name = child.gameObject.name;
+                    // Only disable DirectTo arrows (visual highlights).
+                    // CaptureInput overlays are the tap targets that TutorialGraphicRaycaster
+                    // uses to detect "tap to continue" — disabling them breaks advancement
+                    // and causes voice lines to overlap because tutorial steps race.
+                    if (name.Contains("DirectTo"))
                     {
                         child.gameObject.SetActive(false);
-                        DebugLogger.Log(LogCategory.Handler, "Main", $"Dismissed blocking overlay: {childName}");
+                        DebugLogger.Log(LogCategory.Handler, "Main",
+                            $"Dismissed blocking overlay: {name}");
                     }
                 }
             }
 
-            GameObject stakesTut = GameObject.Find("StakesTutorial_1(Clone)");
-            if (stakesTut != null && stakesTut.activeInHierarchy)
+            GameObject stakes = GameObject.Find("StakesTutorial_1(Clone)");
+            if (stakes != null && stakes.activeInHierarchy)
             {
-                stakesTut.SetActive(false);
+                stakes.SetActive(false);
                 DebugLogger.Log(LogCategory.Handler, "Main", "Dismissed in-game tutorial overlay");
             }
 
-            GameObject customCardTut = GameObject.Find("UnlockedCustomCardsTutorialLandscape");
-            if (customCardTut != null && customCardTut.activeInHierarchy)
+            GameObject customCards = GameObject.Find("UnlockedCustomCardsTutorialLandscape");
+            if (customCards != null && customCards.activeInHierarchy)
             {
-                customCardTut.SetActive(false);
+                customCards.SetActive(false);
                 DebugLogger.Log(LogCategory.Handler, "Main", "Dismissed custom card tutorial overlay");
             }
         }
@@ -248,4 +240,5 @@ public class Main : MelonMod
             _announcer.Announce(Loc.Get("help_text"), AnnouncementPriority.High);
         }
     }
+
 }

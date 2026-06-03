@@ -15,6 +15,45 @@
 
 ### Changed
 - `AnnouncementService` now takes an injectable speech-output seam and clock instead of calling the screen-reader bridge and the system clock directly. Behavior is unchanged; the two identical High/Immediate branches were collapsed into one.
+## v0.6 — 2026-06-02
+
+### Deck Management Overhaul
+- **Deck submenu** — Press Enter on a deck to open a navigable menu: Add Cards, View Deck Cards, Copy Deck Code, Delete Deck, Back
+- **Deck Builder** — Full card browsing with battlefield-style navigation:
+  - Left/Right: Navigate cards
+  - Down (multiple presses): Cost, Power, Ability (same detail levels as battlefield)
+  - Up: Go back one detail level
+  - Enter: Add card (collection) or remove card (deck)
+  - Tab: Switch between Deck Cards and Collection Cards areas
+  - Home/End: Jump to first/last card
+  - A-Z: Letter jump
+- **Add Cards** — Browse full collection, press Enter to add to current deck
+- **View Deck Cards** — Browse cards in deck, press Enter to remove
+- **Copy Deck Code** — Copies deck code via context menu
+- **Delete Deck** — Clicks discard button, game's confirm dialog handled by DialogHandler naturally
+- **Backspace in Deck Builder** returns to collection (not main menu)
+
+### Delete Flow Rework
+- Removed custom delete confirmation handler that conflicted with DialogHandler
+- Delete now uses the game's native confirm dialog ("Do it!" / "Cancel") handled by DialogHandler
+- Auto-rescans collection after deletion with retry logic to detect when deleted deck is actually removed from UI
+
+### New Handlers
+- **NewsHandler** — Dedicated handler for News screen navigation
+- **NotificationScanner** — Background notification detection and announcement
+- **ShortcutRegistry** — Centralized shortcut key management
+
+### Battlefield Improvements
+- Tutorial card marking with target location hints
+- Play rollback detection (card returned to hand)
+- Improved opponent card detection
+
+### Bug Fixes
+- Fixed DeckBuilderHandler detection — uses direct `GameObject.Find("Grid_CardSlots")` instead of Il2Cpp generic component lookup that silently failed
+- Fixed DeckBuilderHandler priority conflict — now managed as sub-handler of MainMenuHandler instead of competing via NavigatorManager preemption
+- Fixed scan retry logic — `_forceRescan` no longer consumed on failed scans
+- Collection card scanning excludes deck cards and object pool cards properly
+- Deck name reading walks up hierarchy from Grid_CardSlots to find DeckEditSection
 
 ---
 

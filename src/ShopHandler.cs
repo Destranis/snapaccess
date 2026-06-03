@@ -150,7 +150,7 @@ public class ShopHandler : IScreenNavigator
             try
             {
                 // Find toggle/tab buttons
-                Toggle[] toggles = root.GetComponentsInChildren<Toggle>(true);
+                Il2CppArrayBase<Toggle> toggles = root.GetComponentsInChildren<Toggle>(true);
                 foreach (var toggle in toggles)
                 {
                     if (toggle == null || !((Component)toggle).gameObject.activeInHierarchy) continue;
@@ -202,7 +202,7 @@ public class ShopHandler : IScreenNavigator
 
         try
         {
-            Button[] buttons = root.GetComponentsInChildren<Button>(true);
+            Il2CppArrayBase<Button> buttons = root.GetComponentsInChildren<Button>(true);
             if (buttons == null || buttons.Length == 0) return;
 
             // Group buttons by their parent section container
@@ -266,7 +266,7 @@ public class ShopHandler : IScreenNavigator
     {
         try
         {
-            TMP_Text[] texts = ((Component)btn).GetComponentsInChildren<TMP_Text>(true);
+            Il2CppArrayBase<TMP_Text> texts = ((Component)btn).GetComponentsInChildren<TMP_Text>(true);
             if (texts == null || texts.Length == 0) return null;
 
             string name = "";
@@ -359,7 +359,7 @@ public class ShopHandler : IScreenNavigator
     {
         try
         {
-            TMP_Text[] texts = ((Component)toggle).GetComponentsInChildren<TMP_Text>(true);
+            Il2CppArrayBase<TMP_Text> texts = ((Component)toggle).GetComponentsInChildren<TMP_Text>(true);
             foreach (var t in texts)
             {
                 if (t == null) continue;
@@ -428,11 +428,11 @@ public class ShopHandler : IScreenNavigator
             return;
         }
 
-        if (_holdRepeater.Check(SDLInput.Key.Left, () => MovePrev())) { }
-        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft)) MovePrev();
-        else if (_holdRepeater.Check(SDLInput.Key.Right, () => MoveNext())) { }
-        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight)) MoveNext();
-        else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
+        if (_holdRepeater.Check(SDLInput.Key.Up, () => MovePrev())) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp)) MovePrev();
+        else if (_holdRepeater.Check(SDLInput.Key.Down, () => MoveNext())) { }
+        else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown)) MoveNext();
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Right) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
             ReadDetails();
         else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
             ActivateFocused();
@@ -524,9 +524,10 @@ public class ShopHandler : IScreenNavigator
                 var item = items[_itemIndex];
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("shop_activating", item.Name));
                 if (item.Button != null)
-                    UIHelper.ClickButtonWithFallback(item.Button);
-                // Deactivate so DialogHandler can handle any popup
-                _isActive = false;
+                    UIHelper.ActivateButton(item.Button);
+                // Force rescan — the shop view may still be active (item detail)
+                // or may have closed (purchase dialog). Let ScanScreen detect the change.
+                _lastScanTime = 0f;
             }
         }
     }

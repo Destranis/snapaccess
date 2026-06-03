@@ -9,6 +9,7 @@ using Il2CppApp.Game.UI.Button;
 using Il2CppCubeUnity.App.Game;
 using Il2CppCubeUnity.App.Game.SpeechBubble;
 using Il2CppCubeUnity.App.Tutorials;
+using Il2CppDarkTonic.MasterAudio;
 using DefaultTutorialState = Il2CppCubeUnity.App.Game.DefaultScenarioTutorialBehavior.DefaultTutorialState;
 using Il2CppCubeUnity.App.View;
 using Il2CppInterop.Runtime;
@@ -63,7 +64,6 @@ public class BattlefieldHandler : IScreenNavigator
     private readonly KeyHoldRepeater _holdRepeater = new KeyHoldRepeater();
 
     private GameInputManager _gim;
-    private HandZoneController _handZone;
     private CardView _selectedCard;
 
     private string _lastTutorialText = "";
@@ -75,6 +75,32 @@ public class BattlefieldHandler : IScreenNavigator
     private bool _tutorialTextsInitialized = false;
     private float _tutorialInitStartTime = 0f;
     private string _lastTapScanState = "";
+
+    // Auto-advance: when tap-to-continue is visible for this long, auto-click to advance
+    private float _tapToContinueVisibleSince = 0f;
+    private const float AutoAdvanceDelay = 3.0f;
+
+    // Tutorial stuck detection: track last successful player action time
+    private float _lastPlayerActionTime = 0f;
+    private bool _stuckHintAnnounced = false;
+    private const float StuckDetectionDelay = 5.0f;
+
+    // Tutorial play failure tracking: detect when tutorial blocks all card plays
+    private int _tutorialPlayFailCount = 0;
+
+    // Tutorial expected card detection: probe CanDragCard without our patch
+    private static bool _probingCanDrag = false;
+    private static int _trackedCurrentEnergy = -1;
+    private static int _trackedDefaultEnergy = -1;
+    private readonly HashSet<int> _tutorialExpectedEntityIds = new HashSet<int>();
+    private float _lastTutorialProbeTime = 0f;
+    private float _tutorialAdvanceCooldownUntil = 0f;
+    private const float TutorialAdvanceCooldown = 2.5f;
+    private float _lastTutorialAdvanceTime = 0f;
+    private const float TutorialAdvanceThrottle = 4.0f;
+
+    // Turn change detection: use actual turn text to avoid false detections from hand count fluctuation
+    private string _lastDetectedTurnText = "";
 
     private static bool _harmonyPatched = false;
     private static bool _stepMapHooked = false;
@@ -250,7 +276,6 @@ public class BattlefieldHandler : IScreenNavigator
     {
         _active = false;
         _gim = null;
-        _handZone = null;
         _handCards.Clear();
         _locations.Clear();
         _handIndex = 0;
@@ -265,6 +290,10 @@ public class BattlefieldHandler : IScreenNavigator
         _tapToContinueAnnounced = false;
         _tutorialTextsInitialized = false;
         _tutorialInitStartTime = 0f;
+        _tapToContinueVisibleSince = 0f;
+        _lastPlayerActionTime = 0f;
+        _stuckHintAnnounced = false;
+        _tutorialPlayFailCount = 0;
 
         _wasInGame = false;
         _inPopup = false;
@@ -315,6 +344,29 @@ public class BattlefieldHandler : IScreenNavigator
             _gim = null;
         }
         if ((Object)(object)_gim == (Object)null) return;
+
+        // After game over, check if we've left the match (Navigator appeared = back at menus)
+        if (_gameOverAnnounced)
+        {
+            try
+            {
+                var nav = UIHelper.FindComponent<Il2CppCubeUnity.App.Navigator.Navigator>();
+                if ((Object)(object)nav != (Object)null && nav.IsShown
+                    && ((Component)nav).gameObject.activeInHierarchy)
+                {
+                    DebugLogger.Log(LogCategory.State, "BattlefieldHandler",
+                        "Navigator visible after game over — deactivating");
+                    _gim = null;
+                    _active = false;
+                    _handCards.Clear();
+                    _locations.Clear();
+                    return;
+                }
+            }
+            catch { }
+            // Game over: stop scanning cards/locations (they're stale)
+            return;
+        }
 
         if (!_stepMapHooked)
         {
@@ -385,7 +437,7 @@ public class BattlefieldHandler : IScreenNavigator
                     if (goName.Contains("BackgroundClose", StringComparison.OrdinalIgnoreCase) ||
                         goName.Contains("Header_CardDetails", StringComparison.OrdinalIgnoreCase))
                     {
-                        UIHelper.ClickButton(btn);
+                        UIHelper.ActivateButton(btn);
                         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                             "Auto-dismissed 'Never Seen Before' popup via " + goName);
                         return;
@@ -406,14 +458,6 @@ public class BattlefieldHandler : IScreenNavigator
         _handCards.Clear();
         try
         {
-            if ((Object)(object)_handZone == (Object)null)
-            {
-                _handZone = UIHelper.FindComponent<HandZoneController>();
-                if ((Object)(object)_handZone != (Object)null)
-                {
-                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "HandZoneController found");
-                }
-            }
             Il2CppArrayBase<CardView> cards = Object.FindObjectsOfType<CardView>();
             if (cards == null || cards.Count == 0)
             {
@@ -489,9 +533,13 @@ public class BattlefieldHandler : IScreenNavigator
                 }
             }
             // Delayed play verification: if mouse drag was used, check hand count after delay
+            // Skip in tutorial mode — tutorial animations are slower and cause false alarms
             if (_playVerifyTime > 0f && Time.time >= _playVerifyTime)
             {
-                if (_handCards.Count > _playVerifyExpectedCount && _lastPlayedCardName != null)
+                bool inTutorial = false;
+                try { inTutorial = (Object)(object)UIHelper.FindComponent<VfxScenarioTutorialAction>() != (Object)null; } catch { }
+
+                if (!inTutorial && _handCards.Count > _playVerifyExpectedCount && _lastPlayedCardName != null)
                 {
                     // Card is still in hand — the play failed silently
                     AnnouncementService.Instance.Announce(Loc.Get("bf_play_failed_silent", _lastPlayedCardName), AnnouncementPriority.Immediate);
@@ -501,6 +549,11 @@ public class BattlefieldHandler : IScreenNavigator
                     _lastPlayedEntityId = -1;
                     _handCountAfterPlay = -1;
                     _rollbackConfirmStartTime = 0f;
+                }
+                else if (inTutorial)
+                {
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        $"Tutorial: skipping play verification for {_lastPlayedCardName}");
                 }
                 _playVerifyTime = 0f;
                 _playVerifyExpectedCount = -1;
@@ -517,6 +570,9 @@ public class BattlefieldHandler : IScreenNavigator
                 }
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                     $"Hand changed: {_handCards.Count} cards [{cardNames}]");
+
+                // Re-probe tutorial expected cards when hand changes
+                ProbeTutorialExpectedCards();
             }
         }
         catch (Exception ex)
@@ -801,28 +857,33 @@ public class BattlefieldHandler : IScreenNavigator
     {
         try
         {
-            // Track hand count for detecting turn changes — skip if game is over
-            if (!_gameOverAnnounced && _handCards.Count != _lastHandCount)
+            // Track turn changes using the actual turn counter text, not hand count.
+            // Hand count fluctuates during tutorial animations (card duplicates briefly appear),
+            // causing false turn-change detections that repeat tutorial text and voice lines.
+            if (!_gameOverAnnounced)
             {
-                if (_lastHandCount >= 0)
+                string currentTurn = GetTurnText() ?? "";
+                bool turnActuallyChanged = !string.IsNullOrEmpty(currentTurn) && currentTurn != _lastDetectedTurnText;
+
+                if (turnActuallyChanged)
                 {
+                    _lastDetectedTurnText = currentTurn;
                     // Turn changed — only clear LocString cache so turn-specific instructions
                     // can re-announce. Do NOT clear _announcedTooltips — static tooltip texts
                     // (like "Cards cost Energy") should not be re-read every turn.
                     _lastLocString = "";
                     _turnChangeCount++;
+                    _tutorialPlayFailCount = 0;
                     _timerWarningAnnounced = false;
                     _turnTimerWarningFired = false;
                     _turnTimerUrgentFired = false;
                     _deferredDrawnCardsMessage = null;
                     // Cooldown: wait for card reveal animations to finish before scanning for opponent plays.
-                    // Cards fly/animate for ~3-5 seconds during the reveal phase.
                     _opponentScanCooldownUntil = Time.time + 2.0f;
-                    // Enable opponent detection after the first turn change (cards dealt and resolved)
+                    // Enable opponent detection after the first turn change
                     if (!_gameReadyForOpponentDetection && _turnChangeCount >= 1)
                     {
                         _gameReadyForOpponentDetection = true;
-                        // Snapshot all current board cards so we don't announce pre-existing ones
                         SnapshotExistingBoardCards();
                         DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                             "Opponent detection enabled after turn change");
@@ -844,19 +905,25 @@ public class BattlefieldHandler : IScreenNavigator
                     {
                         AutoAnnounceTurnStart();
                     }
-                    // Store drawn cards for on-demand announcement via D key (skip initial deal)
+                    // Reset stuck hint so it fires sooner on the new turn
+                    _stuckHintAnnounced = false;
+                    _lastPlayerActionTime = Time.time;
+                }
+
+                // Track hand count changes for drawn card detection (separate from turn detection)
+                if (_handCards.Count != _lastHandCount)
+                {
                     if (_gameReadyForOpponentDetection && _handCards.Count > _lastHandCount && _previousHandEntityIds.Count > 0)
                     {
                         StoreDrawnCards();
                     }
+                    _previousHandEntityIds.Clear();
+                    for (int ci = 0; ci < _handCards.Count; ci++)
+                    {
+                        try { _previousHandEntityIds.Add(_handCards[ci].EntityId); } catch { }
+                    }
+                    _lastHandCount = _handCards.Count;
                 }
-                // Update previous hand EntityIds for next comparison
-                _previousHandEntityIds.Clear();
-                for (int ci = 0; ci < _handCards.Count; ci++)
-                {
-                    try { _previousHandEntityIds.Add(_handCards[ci].EntityId); } catch { }
-                }
-                _lastHandCount = _handCards.Count;
             }
 
             // Process pending instruction texts (from StepMap hooks, LocString, TapToContinue)
@@ -872,8 +939,15 @@ public class BattlefieldHandler : IScreenNavigator
                     _lastTutorialText = text;
                     if (ModSettings.Instance.TutorialMessages)
                     {
-                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
-                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Instruction: " + text);
+                        if (Time.time < _tutorialAdvanceCooldownUntil)
+                        {
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Instruction suppressed (cooldown): " + text);
+                        }
+                        else
+                        {
+                            AnnouncementService.Instance.Announce(text, AnnouncementPriority.Normal);
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Instruction: " + text);
+                        }
                     }
                 }
             }
@@ -918,8 +992,15 @@ public class BattlefieldHandler : IScreenNavigator
                 if (_announcedTooltips.Add(text))
                 {
                     _lastTutorialText = text;
-                    AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
-                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Tooltip: " + text);
+                    if (Time.time < _tutorialAdvanceCooldownUntil)
+                    {
+                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Tooltip suppressed (cooldown): " + text);
+                    }
+                    else
+                    {
+                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
+                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Tooltip: " + text);
+                    }
                 }
             }
 
@@ -947,8 +1028,15 @@ public class BattlefieldHandler : IScreenNavigator
                     if (text.Length >= 3 && _announcedTooltips.Add(text))
                     {
                         _lastTutorialText = text;
-                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
-                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "SpeechBubble: " + text);
+                        if (Time.time < _tutorialAdvanceCooldownUntil)
+                        {
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "SpeechBubble suppressed (cooldown): " + text);
+                        }
+                        else
+                        {
+                            AnnouncementService.Instance.Announce(text, AnnouncementPriority.Normal);
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "SpeechBubble: " + text);
+                        }
                     }
                 }
             }
@@ -1004,14 +1092,34 @@ public class BattlefieldHandler : IScreenNavigator
             if (tapVisible && !_tapToContinueAnnounced)
             {
                 _tapToContinueAnnounced = true;
-                _lastInstructionText = Loc.Get("bf_tap_to_continue");
-                AnnouncementService.Instance.Announce(Loc.Get("bf_tap_to_continue"), AnnouncementPriority.Low);
-                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinue state detected");
+                _tapToContinueVisibleSince = Time.time;
+                // Check if player has 0 energy — give a more specific hint
+                int energy = GetCurrentEnergy();
+                string tapMsg;
+                if (energy == 0)
+                    tapMsg = Loc.Get("bf_zero_energy_hint");
+                else
+                    tapMsg = Loc.Get("bf_tap_to_continue");
+                _lastInstructionText = tapMsg;
+                // Suppress during advance cooldown so speeches don't overlap
+                if (Time.time < _tutorialAdvanceCooldownUntil)
+                {
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinue suppressed (cooldown), energy=" + energy);
+                }
+                else
+                {
+                    // High priority so it's not interrupted by turn-start messages
+                    AnnouncementService.Instance.Announce(tapMsg, AnnouncementPriority.High);
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinue state detected, energy=" + energy);
+                }
             }
             else if (!tapVisible && _tapToContinueAnnounced)
             {
                 _tapToContinueAnnounced = false;
+                _tapToContinueVisibleSince = 0f;
             }
+
+            // Auto-advance removed — let the user control tutorial pacing with Space
 
             // Also read the TapToContinueText content if it has readable text
             if ((Object)(object)tapText != (Object)null
@@ -1026,8 +1134,15 @@ public class BattlefieldHandler : IScreenNavigator
                     {
                         _lastInstructionText = text;
                         _lastTutorialText = text;
-                        AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
-                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinueText: " + text);
+                        if (Time.time < _tutorialAdvanceCooldownUntil)
+                        {
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinueText suppressed (cooldown): " + text);
+                        }
+                        else
+                        {
+                            AnnouncementService.Instance.Announce(text, AnnouncementPriority.Normal);
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TapToContinueText: " + text);
+                        }
                     }
                 }
             }
@@ -1087,7 +1202,13 @@ public class BattlefieldHandler : IScreenNavigator
                 if (!_announcedTooltips.Add(text)) continue;
                 _lastInstructionText = text;
                 _lastTutorialText = text;
-                AnnouncementService.Instance.Announce(text, AnnouncementPriority.Low);
+                // Suppress during advance cooldown so speeches don't overlap
+                if (Time.time < _tutorialAdvanceCooldownUntil)
+                {
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TutorialText suppressed (cooldown): " + text);
+                    continue;
+                }
+                AnnouncementService.Instance.Announce(text, AnnouncementPriority.Normal);
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TutorialText: " + text);
             }
 
@@ -1204,7 +1325,80 @@ public class BattlefieldHandler : IScreenNavigator
                 DebugLogger.Warning("Failed to patch VfxTutorial.CanZoomCard: " + ex.Message);
             }
 
-            MelonLogger.Msg("Tutorial Harmony patches applied");
+            // Patch SpeechBubbleController.SetSoundGroup — cancel other playing voice lines
+            // before starting a new one, so two characters never speak simultaneously.
+            try
+            {
+                MethodInfo setSoundGroup = AccessTools.Method(
+                    typeof(SpeechBubbleController), "SetSoundGroup", null, null);
+                if (setSoundGroup != null)
+                {
+                    harmony.Patch((MethodBase)setSoundGroup,
+                        new HarmonyMethod(typeof(BattlefieldHandler), nameof(PrefixSetSoundGroup)),
+                        null, null, null, null);
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        "Patched SpeechBubbleController.SetSoundGroup");
+                }
+                else
+                {
+                    DebugLogger.Warning("SetSoundGroup method not found on SpeechBubbleController");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Warning("Failed to patch SpeechBubbleController.SetSoundGroup: " + ex.Message);
+            }
+
+            // Patch VfxScenarioTutorialAction.PlayCustomEventCue — stop previous voice lines
+            // before a new custom event cue plays. Voice lines go through MasterAudio, not
+            // through SpeechBubbleController, so this catches the actual audio path.
+            try
+            {
+                MethodInfo playEventCue = AccessTools.Method(
+                    typeof(VfxScenarioTutorialAction), "PlayCustomEventCue", null, null);
+                if (playEventCue != null)
+                {
+                    harmony.Patch((MethodBase)playEventCue,
+                        new HarmonyMethod(typeof(BattlefieldHandler), nameof(PrefixPlayCustomEventCue)),
+                        null, null, null, null);
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        "Patched VfxScenarioTutorialAction.PlayCustomEventCue");
+                }
+                else
+                {
+                    DebugLogger.Warning("PlayCustomEventCue method not found on VfxScenarioTutorialAction");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Warning("Failed to patch PlayCustomEventCue: " + ex.Message);
+            }
+
+            // Patch EnergyView.ShowEnergyChanged — track real energy values so GetCurrentEnergy
+            // returns accurate data even during tutorial animations/transitions.
+            try
+            {
+                MethodInfo showEnergy = AccessTools.Method(
+                    typeof(EnergyView), "ShowEnergyChanged", null, null);
+                if (showEnergy != null)
+                {
+                    harmony.Patch((MethodBase)showEnergy, null,
+                        new HarmonyMethod(typeof(BattlefieldHandler), nameof(PostfixShowEnergyChanged)),
+                        null, null, null);
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        "Patched EnergyView.ShowEnergyChanged");
+                }
+                else
+                {
+                    DebugLogger.Warning("ShowEnergyChanged method not found on EnergyView");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Warning("Failed to patch EnergyView.ShowEnergyChanged: " + ex.Message);
+            }
+
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "Tutorial Harmony patches applied");
         }
         catch (Exception ex)
         {
@@ -1212,16 +1406,31 @@ public class BattlefieldHandler : IScreenNavigator
         }
     }
 
-    /// <summary>Prefix patch: force GameInputManager.CanDragCard to return true.</summary>
+    /// <summary>Prefix patch: force GameInputManager.CanDragCard to return true when the tutorial
+    /// allows card dragging (_WaitStateCanDragCard). Respects tutorial restrictions otherwise.</summary>
     private static bool PrefixCanDragCard(ref bool __result)
     {
+        if (_probingCanDrag) return true; // Let original run during probing
+        // Only override when the tutorial explicitly allows card dragging
+        try
+        {
+            VfxScenarioTutorialAction action = UIHelper.FindComponent<VfxScenarioTutorialAction>();
+            if ((Object)(object)action != (Object)null && !action._WaitStateCanDragCard)
+                return true; // Let original run — tutorial doesn't allow dragging yet
+        }
+        catch { }
         __result = true;
         return false; // Skip original method
     }
 
-    /// <summary>Prefix patch: force VfxScenarioTutorialAction.CanDragCard to return true.</summary>
-    private static bool PrefixTutorialCanDragCard(ref bool __result)
+    /// <summary>Prefix patch: force VfxScenarioTutorialAction.CanDragCard to return true when
+    /// the tutorial allows dragging. Respects restrictions when _WaitStateCanDragCard is false.</summary>
+    private static bool PrefixTutorialCanDragCard(VfxScenarioTutorialAction __instance, ref bool __result)
     {
+        if (_probingCanDrag) return true; // Let original run during probing
+        // Only override when the tutorial explicitly allows card dragging
+        if (!__instance._WaitStateCanDragCard)
+            return true; // Let original run — tutorial doesn't allow dragging yet
         __result = true;
         return false; // Skip original method
     }
@@ -1231,6 +1440,128 @@ public class BattlefieldHandler : IScreenNavigator
     {
         __result = true;
         return false; // Skip original method
+    }
+
+    /// <summary>Prefix patch: cancel other speech bubble voice lines before starting a new one.
+    /// Prevents two characters from speaking simultaneously during tutorials.</summary>
+    private static void PrefixSetSoundGroup(SpeechBubbleController __instance, string soundGroup)
+    {
+        if (string.IsNullOrEmpty(soundGroup)) return;
+        try
+        {
+            Il2CppArrayBase<SpeechBubbleController> controllers =
+                Object.FindObjectsOfType<SpeechBubbleController>();
+            if (controllers == null) return;
+            for (int i = 0; i < controllers.Count; i++)
+            {
+                SpeechBubbleController other = controllers[i];
+                if ((Object)(object)other == (Object)null) continue;
+                if ((Object)(object)other == (Object)(object)__instance) continue;
+                // Cancel any currently playing voice on other speech bubbles
+                try { other.CancelSoundGroup(); }
+                catch { }
+            }
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                $"Voice serialization: cancelled {controllers.Count - 1} other bubbles before '{soundGroup}'");
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                "PrefixSetSoundGroup failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>Prefix patch: stop playing voice lines before a new custom event cue fires.
+    /// Voice lines go through PlayCustomEventCue/MasterAudio, not through SpeechBubbleController.</summary>
+    private static void PrefixPlayCustomEventCue(VfxScenarioTutorialAction __instance, string eventCueName)
+    {
+        if (string.IsNullOrEmpty(eventCueName)) return;
+        try
+        {
+            StopTutorialVoiceLines();
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                $"PlayCustomEventCue: stopped previous voices before '{eventCueName}'");
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                "PrefixPlayCustomEventCue failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>Stops all currently playing tutorial voice lines via SpeechBubble and MasterAudio.</summary>
+    private static void StopTutorialVoiceLines()
+    {
+        try
+        {
+            // Cancel all speech bubble audio — both the controller's sound group
+            // and MasterAudio sounds by group name and transform
+            Il2CppArrayBase<SpeechBubbleController> controllers =
+                Object.FindObjectsOfType<SpeechBubbleController>();
+            if (controllers != null)
+            {
+                for (int i = 0; i < controllers.Count; i++)
+                {
+                    try { controllers[i]?.CancelSoundGroup(); } catch { }
+                    // Stop MasterAudio by sound group name (not just transform)
+                    try
+                    {
+                        string groupName = controllers[i]?._soundGroup;
+                        if (!string.IsNullOrEmpty(groupName))
+                            MasterAudio.StopAllOfSound(groupName);
+                    }
+                    catch { }
+                    // Also stop by transform (catches child objects)
+                    try
+                    {
+                        Transform t = ((Component)controllers[i]).transform;
+                        if ((Object)(object)t != (Object)null)
+                            MasterAudio.StopAllSoundsOfTransform(t);
+                    }
+                    catch { }
+                }
+            }
+
+            // Cancel the SpeechBubbleManager's active bubble
+            try
+            {
+                var manager = Object.FindObjectOfType<SpeechBubbleManager>();
+                if ((Object)(object)manager != (Object)null)
+                    manager.CancelActiveSpeechBubble();
+            }
+            catch { }
+
+            // Stop sounds on tutorial action transforms
+            Il2CppArrayBase<VfxScenarioTutorialAction> actions =
+                Object.FindObjectsOfType<VfxScenarioTutorialAction>();
+            if (actions != null)
+            {
+                for (int i = 0; i < actions.Count; i++)
+                {
+                    try
+                    {
+                        Transform t = ((Component)actions[i]).transform;
+                        if ((Object)(object)t != (Object)null)
+                            MasterAudio.StopAllSoundsOfTransform(t);
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                "StopTutorialVoiceLines failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>Postfix patch: track energy values from EnergyView updates.</summary>
+    private static void PostfixShowEnergyChanged(int currentEnergy, int defaultEnergy)
+    {
+        _trackedCurrentEnergy = currentEnergy;
+        _trackedDefaultEnergy = defaultEnergy;
+        DebugLogger.Log(LogCategory.State, "BattlefieldHandler",
+            $"Energy updated: {currentEnergy}/{defaultEnergy}");
     }
 
     private void PatchMethod(HarmonyLib.Harmony harmony, System.Type targetType, string methodName, string postfixName)
@@ -1578,6 +1909,13 @@ public class BattlefieldHandler : IScreenNavigator
 
     private void ProcessInput()
     {
+        // Reset stuck detection when the player presses any key
+        if (SDLInput.AnyKeyDown())
+        {
+            _lastPlayerActionTime = Time.time;
+            _stuckHintAnnounced = false;
+        }
+
         // C: Focus hand — browse cards with left/right
         if (SDLInput.IsKeyDown(SDLInput.Key.C))
         {
@@ -1640,7 +1978,24 @@ public class BattlefieldHandler : IScreenNavigator
         // Space: Advance tutorial
         else if (SDLInput.IsKeyDown(SDLInput.Key.Space) || SDLInput.IsButtonDown(SDLInput.GamepadButton.West))
         {
-            TryAdvanceTutorial();
+            if (Time.time - _lastTutorialAdvanceTime >= TutorialAdvanceThrottle)
+            {
+                _lastTutorialAdvanceTime = Time.time;
+                if (_ironManPlayed)
+                {
+                    // After Iron Man, center-click doesn't work — force-advance directly
+                    StopTutorialVoiceLines();
+                    ForceAdvanceTutorial();
+                }
+                else
+                {
+                    TryAdvanceTutorial();
+                }
+            }
+            else
+            {
+                DebugLogger.LogInput("Space", "Throttled — wait for voiceline to finish");
+            }
         }
         // E: End turn
         else if (SDLInput.IsKeyDown(SDLInput.Key.E) || SDLInput.IsButtonDown(SDLInput.GamepadButton.Start))
@@ -2096,7 +2451,7 @@ public class BattlefieldHandler : IScreenNavigator
     {
         if ((Object)(object)btn == (Object)null) return;
         // Try onClick.Invoke first (most reliable for standard UI buttons)
-        if (UIHelper.ClickButton(btn)) return;
+        if (UIHelper.ActivateButton(btn)) return;
         // Fallback to mouse simulation
         SimulateClickOnButton((Component)btn);
     }
@@ -2524,6 +2879,23 @@ public class BattlefieldHandler : IScreenNavigator
             DebugLogger.LogInput("Enter", "Revealing face-down card");
             return;
         }
+
+        // Block selection if card costs more than available energy
+        if (!IsCardAffordable(card, cardName)) return;
+
+        // Block selection of non-expected cards in tutorial
+        if (_tutorialExpectedEntityIds.Count > 0 && !IsTutorialExpectedCard(card))
+        {
+            string expected = GetTutorialExpectedCardName();
+            if (expected != null)
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("bf_tutorial_wrong_card", cardName, expected), AnnouncementPriority.Immediate);
+            else
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("bf_play_failed", cardName, ""), AnnouncementPriority.Immediate);
+            return;
+        }
+
         if (_playState == PlayState.CardSelected && (Object)(object)_selectedCard == (Object)(object)card)
         {
             _selectedCard = null;
@@ -2543,10 +2915,44 @@ public class BattlefieldHandler : IScreenNavigator
     {
         if ((Object)(object)_selectedCard == (Object)null || _locations.Count == 0 || _locationIndex >= _locations.Count) return;
 
+        // If tutorial is waiting for a tap, auto-advance it first — card plays are blocked until then
+        if (_tapToContinueAnnounced)
+        {
+            TryAdvanceTutorial();
+            AnnouncementService.Instance.Announce(Loc.Get("bf_tap_to_continue"), AnnouncementPriority.Immediate);
+            _selectedCard = null;
+            _playState = PlayState.Browsing;
+            _area = FocusArea.Hand;
+            return;
+        }
+
+        // In tutorial mode, check if the user is playing to the correct location
+        bool inTutorial = false;
+        try { inTutorial = (Object)(object)UIHelper.FindComponent<VfxScenarioTutorialAction>() != (Object)null; } catch { }
+
+        string cardName = GetCardName(_selectedCard);
+
+        if (inTutorial)
+        {
+            int hintIdx = FindTutorialTargetLocation(cardName);
+            if (hintIdx >= 0 && hintIdx < _locations.Count && hintIdx != _locationIndex)
+            {
+                // Wrong location — tell the user where to play instead
+                string correctLocName = GetLocationName(_locations[hintIdx]);
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("bf_tutorial_wrong_location", cardName, correctLocName), AnnouncementPriority.Immediate);
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    $"Tutorial: {cardName} should go to {correctLocName} (idx {hintIdx}), not idx {_locationIndex}");
+                _selectedCard = null;
+                _playState = PlayState.Browsing;
+                _area = FocusArea.Hand;
+                return;
+            }
+        }
+
         LocationView loc = _locations[_locationIndex];
         if ((Object)(object)loc == (Object)null) return;
 
-        string cardName = GetCardName(_selectedCard);
         string locationName = GetLocationName(loc);
         try
         {
@@ -2586,16 +2992,40 @@ public class BattlefieldHandler : IScreenNavigator
                     if (!success)
                     {
                         try { _gim.StopDragCard(_selectedCard); } catch { }
+
+                        // In tutorial mode, DropCard failure means the tutorial blocks this play
+                        if (inTutorial)
+                        {
+                            _tutorialPlayFailCount++;
+                            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                                $"Tutorial DropCard rejected: {cardName} -> {locationName} (fail #{_tutorialPlayFailCount})");
+                            if (_tutorialPlayFailCount >= 2)
+                            {
+                                AnnouncementService.Instance.Announce(
+                                    Loc.Get("bf_tutorial_blocked"), AnnouncementPriority.Immediate);
+                                // Don't ForceAdvanceTutorial — it breaks step sequencing.
+                                // Let the user try a different card/location or press Space.
+                                AnnounceActiveTutorialHints();
+                            }
+                            else
+                            {
+                                AnnouncementService.Instance.Announce(
+                                    Loc.Get("bf_play_failed", cardName, locationName), AnnouncementPriority.Immediate);
+                                AnnounceActiveTutorialHints();
+                            }
+                            _selectedCard = null;
+                            _playState = PlayState.Browsing;
+                            _area = FocusArea.Hand;
+                            return;
+                        }
                     }
                 }
                 else
                 {
                     // StartDragCard failed — game doesn't allow dragging this card
-                    // This means the tutorial or game rules restrict this card
                     AnnouncementService.Instance.Announce(Loc.Get("bf_card_restricted", cardName), AnnouncementPriority.Immediate);
                     DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                         $"Card restricted by game: {cardName}");
-                    // Announce any active tutorial hints explaining why
                     AnnounceActiveTutorialHints();
                     _selectedCard = null;
                     _playState = PlayState.Browsing;
@@ -2636,6 +3066,14 @@ public class BattlefieldHandler : IScreenNavigator
 
             if (success)
             {
+                _tutorialPlayFailCount = 0; // Reset tutorial failure tracking on success
+                // Detect Iron Man play for auto-advance of post-play presentation steps
+                if (cardName.Contains("Iron Man", StringComparison.OrdinalIgnoreCase))
+                {
+                    _ironManPlayed = true;
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        "Iron Man play detected — auto-advance enabled");
+                }
                 AnnouncementService.Instance.Announce(Loc.Get("bf_card_played", cardName, locationName), AnnouncementPriority.Immediate);
                 // Track for rollback detection
                 try { _lastPlayedEntityId = _selectedCard.EntityId; } catch { }
@@ -2728,6 +3166,8 @@ public class BattlefieldHandler : IScreenNavigator
                 UIHelper.SimulateMouseClick(((Component)card).gameObject);
                 return;
             }
+            // Block if card costs more than available energy
+            if (!IsCardAffordable(card, name)) return;
             _selectedCard = card;
             _playState = PlayState.CardSelected;
         }
@@ -3133,56 +3573,83 @@ public class BattlefieldHandler : IScreenNavigator
 
     private void TryAdvanceTutorial()
     {
+        // Start cooldown to suppress tutorial text announcements while the game transitions
+        _tutorialAdvanceCooldownUntil = Time.time + TutorialAdvanceCooldown;
+
         try
         {
-            VfxScenarioTutorialAction action = UIHelper.FindComponent<VfxScenarioTutorialAction>();
-            int clickX, clickY;
-
-            // Try to click on the TapToContinueText element position if available
-            if ((Object)(object)action != (Object)null)
-            {
-                TextMeshProUGUI tapText = action._TapToContinueText;
-                if ((Object)(object)tapText != (Object)null && ((Component)tapText).gameObject.activeInHierarchy)
-                {
-                    Camera main = Camera.main;
-                    if ((Object)(object)main != (Object)null)
-                    {
-                        Vector3 tapScreen = main.WorldToScreenPoint(((Component)tapText).transform.position);
-                        clickX = (int)tapScreen.x;
-                        clickY = Screen.height - (int)tapScreen.y;
-                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Clicking TapToContinue at ({clickX},{clickY})");
-
-                        System.IntPtr hwnd = GetForegroundWindow();
-                        POINT pt = new POINT { X = clickX, Y = clickY };
-                        ClientToScreen(hwnd, ref pt);
-                        SetCursorPos(pt.X, pt.Y);
-                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0u, System.IntPtr.Zero);
-                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0u, System.IntPtr.Zero);
-                        _tapToContinueAnnounced = false;
-                        AnnouncementService.Instance.Announce(Loc.Get("bf_tutorial_advance"), AnnouncementPriority.Immediate);
-                        DebugLogger.LogInput("Space", "Tutorial click at TapToContinue element");
-                        return;
-                    }
-                }
-            }
-
-            // Fallback: click center of screen
-            clickX = Screen.width / 2;
-            clickY = Screen.height / 2;
-            System.IntPtr hwnd2 = GetForegroundWindow();
-            POINT pt2 = new POINT { X = clickX, Y = clickY };
-            ClientToScreen(hwnd2, ref pt2);
-            SetCursorPos(pt2.X, pt2.Y);
+            // Simulate a single screen tap — like a sighted player tapping to continue.
+            // Always click center screen. The tap-to-continue overlay is full-screen,
+            // so center always works. Tooltip-targeted clicks were landing on positions
+            // that TutorialGraphicRaycaster blocked.
+            int clickX = Screen.width / 2;
+            int clickY = Screen.height / 2;
+            System.IntPtr hwnd = GetForegroundWindow();
+            POINT pt = new POINT { X = clickX, Y = clickY };
+            ClientToScreen(hwnd, ref pt);
+            SetCursorPos(pt.X, pt.Y);
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0u, System.IntPtr.Zero);
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0u, System.IntPtr.Zero);
+            DebugLogger.LogInput("Space", $"Tutorial click at center ({clickX},{clickY})");
+
             _tapToContinueAnnounced = false;
-            AnnouncementService.Instance.Announce(Loc.Get("bf_tutorial_advance"), AnnouncementPriority.Immediate);
-            DebugLogger.LogInput("Space", "Tutorial click at center");
         }
         catch (Exception ex)
         {
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "TryAdvanceTutorial failed: " + ex.Message);
             AnnouncementService.Instance.Announce(Loc.Get("bf_no_tutorial"), AnnouncementPriority.Normal);
+        }
+    }
+
+    /// <summary>Force-advances the tutorial by manipulating step index and behavior states.
+    /// Used only when the player is truly stuck (e.g., repeated DropCard failures).</summary>
+    private void ForceAdvanceTutorial()
+    {
+        try
+        {
+            // Stop any playing voice lines before force-advancing to prevent overlap
+            StopTutorialVoiceLines();
+
+            VfxScenarioTutorialAction action = UIHelper.FindComponent<VfxScenarioTutorialAction>();
+            if ((Object)(object)action == (Object)null) return;
+
+            try
+            {
+                int currentStep = action._stepIndex;
+                action._stepIndex = currentStep + 1;
+                DebugLogger.LogInput("ForceAdvance", $"Tutorial stepIndex: {currentStep} -> {currentStep + 1}");
+                try { action.OnEndProcessingSteps(); } catch { }
+                try { action.OnStartProcessingSteps(); } catch { }
+            }
+            catch (Exception stepEx)
+            {
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    "StepIndex advance failed: " + stepEx.Message);
+            }
+
+            try
+            {
+                Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<VfxScenarioTutorialBehavior> behaviors = action._behaviors;
+                if (behaviors != null)
+                {
+                    for (int i = 0; i < behaviors.Length; i++)
+                    {
+                        try { behaviors[i].ChangeState(); } catch { }
+                    }
+                    DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                        $"Called ChangeState on {behaviors.Length} behaviors");
+                }
+            }
+            catch (Exception bhEx)
+            {
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    "Behavior ChangeState failed: " + bhEx.Message);
+            }
+
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", "ForceAdvanceTutorial failed: " + ex.Message);
         }
     }
 
@@ -3293,7 +3760,7 @@ public class BattlefieldHandler : IScreenNavigator
             Button sdBtn = FindEndTurnSDButton();
             if ((Object)(object)sdBtn != (Object)null)
             {
-                if (UIHelper.ClickButton(sdBtn))
+                if (UIHelper.ActivateButton(sdBtn))
                 {
                     AnnouncementService.Instance.Announce(Loc.Get("bf_leaving_game"), AnnouncementPriority.Immediate);
                     DebugLogger.LogInput("E", "Collect Rewards / Exit via direct button click");
@@ -3310,7 +3777,7 @@ public class BattlefieldHandler : IScreenNavigator
                 if ((Object)(object)endBtn != (Object)null)
                 {
                     Button fallbackBtn = ((Component)endBtn).GetComponentInChildren<Button>(true);
-                    if ((Object)(object)fallbackBtn != (Object)null && UIHelper.ClickButton(fallbackBtn))
+                    if ((Object)(object)fallbackBtn != (Object)null && UIHelper.ActivateButton(fallbackBtn))
                     {
                         AnnouncementService.Instance.Announce(Loc.Get("bf_leaving_game"), AnnouncementPriority.Immediate);
                         DebugLogger.LogInput("E", "Collect Rewards / Exit via EndTurnButtonView fallback");
@@ -3439,7 +3906,7 @@ public class BattlefieldHandler : IScreenNavigator
                     string label = UIHelper.GetButtonLabel(btn);
                     // Skip pure numeric labels (collection level counters)
                     if (!string.IsNullOrEmpty(label) && int.TryParse(label.Trim(), out _)) continue;
-                    if (UIHelper.ClickButtonWithFallback(btn))
+                    if (UIHelper.ActivateButton(btn))
                     {
                         AnnouncementService.Instance.Announce(label ?? "Skipped", AnnouncementPriority.Normal);
                         DebugLogger.LogInput("Space", "Post-game skip: " + goName);
@@ -3524,6 +3991,24 @@ public class BattlefieldHandler : IScreenNavigator
             msg = Loc.Get("bf_card_brief", cardName, costStr, _handIndex + 1, _handCards.Count);
         else
             msg = cardName + (string.IsNullOrEmpty(costStr) ? "" : ", " + Loc.Get("deck_builder_cost", costStr));
+
+        // Mark tutorial-expected cards and announce target location
+        if (_tutorialExpectedEntityIds.Count > 0)
+        {
+            if (IsTutorialExpectedCard(card))
+            {
+                int targetIdx = FindTutorialTargetLocation(cardName);
+                if (targetIdx >= 0 && targetIdx < _locations.Count)
+                {
+                    string targetLocName = GetLocationName(_locations[targetIdx]);
+                    msg = Loc.Get("bf_tutorial_marked_loc", targetLocName) + " " + msg;
+                }
+                else
+                {
+                    msg = Loc.Get("bf_tutorial_marked") + " " + msg;
+                }
+            }
+        }
 
         // VerboseCardInfo: append ability text automatically
         if (ModSettings.Instance.VerboseCardInfo)
@@ -3706,9 +4191,14 @@ public class BattlefieldHandler : IScreenNavigator
         return true;
     }
 
-    /// <summary>Returns the current energy value, or -1 if unavailable.</summary>
+    /// <summary>Returns the current energy value, or -1 if unavailable.
+    /// Prefers Harmony-tracked value from ShowEnergyChanged, falls back to UI text scraping.</summary>
     private int GetCurrentEnergy()
     {
+        // Prefer tracked value from Harmony patch — always up to date
+        if (_trackedCurrentEnergy >= 0)
+            return _trackedCurrentEnergy;
+
         try
         {
             EnergyView ev = UIHelper.FindComponent<EnergyView>();
@@ -3730,6 +4220,143 @@ public class BattlefieldHandler : IScreenNavigator
         }
         catch { }
         return -1;
+    }
+
+    /// <summary>Checks if a card's cost is within available energy. Announces and returns false if not.</summary>
+    private bool IsCardAffordable(CardView card, string cardName)
+    {
+        try
+        {
+            CardValueView costView = ((CardRenderer)card)._CostValueView;
+            if ((Object)(object)costView == (Object)null) return true; // Can't read cost, allow
+            int cardCost = costView.Value;
+            int currentEnergy = GetCurrentEnergy();
+            if (currentEnergy >= 0 && cardCost > currentEnergy)
+            {
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("bf_card_too_expensive", cardName, cardCost.ToString(), currentEnergy.ToString()),
+                    AnnouncementPriority.Immediate);
+                return false;
+            }
+        }
+        catch { }
+        return true;
+    }
+
+    /// <summary>Probe which hand cards the tutorial actually expects the player to play.</summary>
+    private void ProbeTutorialExpectedCards()
+    {
+        _tutorialExpectedEntityIds.Clear();
+        try
+        {
+            VfxScenarioTutorialAction tutAction = UIHelper.FindComponent<VfxScenarioTutorialAction>();
+            if ((Object)(object)tutAction == (Object)null) return; // No tutorial active
+
+            // Approach 1: probe via GIM.CanDragCard (bypasses our patch during probing)
+            _probingCanDrag = true;
+            try
+            {
+                if ((Object)(object)_gim != (Object)null)
+                {
+                    for (int i = 0; i < _handCards.Count; i++)
+                    {
+                        CardView cv = _handCards[i];
+                        if ((Object)(object)cv == (Object)null) continue;
+                        try
+                        {
+                            bool allowed = _gim.CanDragCard(cv);
+                            if (allowed)
+                                _tutorialExpectedEntityIds.Add(cv.EntityId);
+                        }
+                        catch { }
+                    }
+                }
+            }
+            finally
+            {
+                _probingCanDrag = false;
+            }
+
+            // Approach 2: if GIM probe found nothing, try matching tooltip text to card names
+            if (_tutorialExpectedEntityIds.Count == 0)
+            {
+                try
+                {
+                    Il2CppArrayBase<TMP_Text> texts = Object.FindObjectsOfType<TMP_Text>();
+                    if (texts != null)
+                    {
+                        for (int t = 0; t < texts.Count; t++)
+                        {
+                            TMP_Text tmp = texts[t];
+                            if ((Object)(object)tmp == (Object)null) continue;
+                            if (!((Component)tmp).gameObject.activeInHierarchy) continue;
+                            if (((Graphic)tmp).color.a < 0.1f) continue;
+
+                            string goName = ((Object)((Component)tmp).gameObject).name;
+                            // Check for tooltip parent objects that name specific cards
+                            // e.g. "IronmanHasASpecialAbility_Tooltip_Timeline"
+                            // or Mask_PlayElektra, Mask_PlaySpiderman
+                            Transform parent = tmp.transform.parent;
+                            while ((Object)(object)parent != (Object)null)
+                            {
+                                string parentName = ((Object)((Component)parent).gameObject).name;
+                                // Match Mask_Play[CardName] or [CardName]_Tooltip patterns
+                                for (int ci = 0; ci < _handCards.Count; ci++)
+                                {
+                                    string cardName = GetCardName(_handCards[ci]);
+                                    if (string.IsNullOrEmpty(cardName)) continue;
+                                    string nameNoSpaces = cardName.Replace(" ", "").Replace("-", "");
+                                    if (parentName.Contains(nameNoSpaces, StringComparison.OrdinalIgnoreCase)
+                                        && (parentName.Contains("Mask_Play", StringComparison.OrdinalIgnoreCase)
+                                            || parentName.Contains("_Tooltip", StringComparison.OrdinalIgnoreCase)))
+                                    {
+                                        _tutorialExpectedEntityIds.Add(_handCards[ci].EntityId);
+                                    }
+                                }
+                                parent = parent.parent;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            _lastTutorialProbeTime = Time.time;
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                $"Tutorial probe: {_tutorialExpectedEntityIds.Count} expected cards of {_handCards.Count}");
+        }
+        catch (Exception ex)
+        {
+            _probingCanDrag = false;
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                "ProbeTutorialExpectedCards failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>Check if a card is the one the tutorial expects to be played.</summary>
+    private bool IsTutorialExpectedCard(CardView card)
+    {
+        if (_tutorialExpectedEntityIds.Count == 0) return true; // No tutorial or probe not run
+        try { return _tutorialExpectedEntityIds.Contains(card.EntityId); }
+        catch { return true; }
+    }
+
+    /// <summary>Get the name of the tutorial-expected card (for guidance messages).</summary>
+    private string GetTutorialExpectedCardName()
+    {
+        if (_tutorialExpectedEntityIds.Count == 0) return null;
+        for (int i = 0; i < _handCards.Count; i++)
+        {
+            CardView cv = _handCards[i];
+            if ((Object)(object)cv == (Object)null) continue;
+            try
+            {
+                if (_tutorialExpectedEntityIds.Contains(cv.EntityId))
+                    return GetCardName(cv);
+            }
+            catch { }
+        }
+        return null;
     }
 
     /// <summary>Count player cards at a specific location index.</summary>
@@ -3838,6 +4465,14 @@ public class BattlefieldHandler : IScreenNavigator
                         break;
                     }
                 }
+            }
+
+            // Fallback for tutorial: derive turn from current energy (tutorial: turn = energy)
+            if (string.IsNullOrEmpty(turnText))
+            {
+                int energy = GetCurrentEnergy();
+                if (energy >= 0)
+                    turnText = energy + " / 6";
             }
 
             if (!string.IsNullOrEmpty(turnText))
@@ -3985,6 +4620,8 @@ public class BattlefieldHandler : IScreenNavigator
         }
     }
 
+    private string _lastAutoTurnAnnouncedTurn = "";
+
     /// <summary>Auto-announces turn number, energy, and "your turn" when a new turn starts.</summary>
     private void AutoAnnounceTurnStart()
     {
@@ -3992,6 +4629,13 @@ public class BattlefieldHandler : IScreenNavigator
         {
             string turnText = GetTurnText();
             string energy = GetEnergyText();
+
+            // Only announce once per actual turn — hand count fluctuates during tutorial
+            // animations (card duplicates briefly appear), causing false turn-change detections.
+            string turnKey = turnText ?? "";
+            if (turnKey == _lastAutoTurnAnnouncedTurn)
+                return;
+            _lastAutoTurnAnnouncedTurn = turnKey;
 
             // Ultra-concise: "Turn 3, energy 3, go." — minimize speech time so user can act fast
             string msg;
@@ -4013,6 +4657,13 @@ public class BattlefieldHandler : IScreenNavigator
             // Immediate priority: interrupts any lingering speech so user hears this first
             AnnouncementService.Instance.Announce(msg, AnnouncementPriority.Immediate);
             _turnPhaseAnnounced = false; // Reset so we can announce "waiting" after they end turn
+
+            // If no cards are playable (energy too low for all hand cards), tell the user immediately
+            int playable = CountPlayableCards();
+            if (playable == 0 && _handCards.Count > 0)
+            {
+                AnnouncementService.Instance.Announce(Loc.Get("bf_no_playable_cards"), AnnouncementPriority.Normal);
+            }
         }
         catch (Exception ex)
         {
@@ -4048,6 +4699,100 @@ public class BattlefieldHandler : IScreenNavigator
         catch { }
         return null;
     }
+
+    /// <summary>
+    /// Detects when the player is stuck during the tutorial and announces what to do.
+    /// Reads the tutorial's actual wait state flags to determine the expected action.
+    /// </summary>
+    private void CheckTutorialStuck()
+    {
+        // Check after the player has been idle
+        if (_lastPlayerActionTime <= 0f) _lastPlayerActionTime = Time.time;
+        if (Time.time - _lastPlayerActionTime < StuckDetectionDelay) return;
+        if (_gameOverAnnounced) return;
+        // Allow hint to repeat every StuckDetectionDelay seconds so the player
+        // doesn't miss it (e.g., during location reveals they don't know about)
+        if (_stuckHintAnnounced)
+        {
+            _lastPlayerActionTime = Time.time;
+            _stuckHintAnnounced = false;
+            return;
+        }
+
+        try
+        {
+            VfxScenarioTutorialAction tutAction = UIHelper.FindComponent<VfxScenarioTutorialAction>();
+            if ((Object)(object)tutAction == (Object)null) return; // No tutorial active
+
+            bool canEndTurn = tutAction._WaitStateCanEndTurn;
+            bool canDragCard = tutAction._WaitStateCanDragCard;
+            bool canZoomCard = false;
+            bool canZoomLocation = false;
+            try { canZoomCard = tutAction._WaitStateCanZoomCard; } catch { }
+            try { canZoomLocation = tutAction._WaitStateCanZoomLocation; } catch { }
+
+            _stuckHintAnnounced = true;
+
+            // Card-playable state takes priority — never say "press space" when cards are playable
+            if (canDragCard)
+            {
+                if (_tutorialPlayFailCount > 0)
+                {
+                    AnnouncementService.Instance.Announce(
+                        Loc.Get("bf_zero_energy_hint"), AnnouncementPriority.High);
+                }
+                else
+                {
+                    int energy = GetCurrentEnergy();
+                    if (energy >= 0 && _handCards.Count > 0)
+                    {
+                        int playable = CountPlayableCards();
+                        if (playable > 0)
+                        {
+                            string hint = !string.IsNullOrEmpty(_lastInstructionText)
+                                ? _lastInstructionText
+                                : Loc.Get("bf_tutorial_play_card_hint");
+                            AnnouncementService.Instance.Announce(hint, AnnouncementPriority.High);
+                        }
+                        else
+                        {
+                            AnnouncementService.Instance.Announce(
+                                Loc.Get("bf_tutorial_end_turn_hint"), AnnouncementPriority.High);
+                        }
+                    }
+                    else
+                    {
+                        AnnouncementService.Instance.Announce(
+                            Loc.Get("bf_tutorial_end_turn_hint"), AnnouncementPriority.High);
+                    }
+                }
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    $"Stuck hint: play card (canEnd={canEndTurn}, canDrag={canDragCard}, energy={GetCurrentEnergy()})");
+            }
+            else if (canEndTurn)
+            {
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("bf_tutorial_end_turn_hint"), AnnouncementPriority.High);
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    "Stuck hint: end turn (canEnd=true, canDrag=false)");
+            }
+            else
+            {
+                // Neither drag nor end turn — waiting for animation or tap
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("bf_tap_to_continue"), AnnouncementPriority.High);
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    "Stuck hint: press Space (canEnd=false, canDrag=false)");
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                "CheckTutorialStuck failed: " + ex.Message);
+        }
+    }
+
+    private bool _ironManPlayed = false;
 
     /// <summary>Checks end turn button text to detect turn phase and announce changes.</summary>
     private void CheckTurnPhase()
@@ -4290,7 +5035,7 @@ public class BattlefieldHandler : IScreenNavigator
                     sb.Append(hints[i]);
                 }
                 string combined = Loc.Get("bf_tutorial_hints", sb.ToString());
-                AnnouncementService.Instance.Announce(combined, AnnouncementPriority.Low);
+                AnnouncementService.Instance.Announce(combined, AnnouncementPriority.Normal);
                 DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
                     $"Tutorial hints announced: {maxHints} of {hints.Count}");
             }
@@ -4301,15 +5046,168 @@ public class BattlefieldHandler : IScreenNavigator
         }
     }
 
+    /// <summary>Finds the tutorial-expected location for a card by parsing visible "Drag X to Y" hints.</summary>
+    private int FindTutorialTargetLocation(string cardName)
+    {
+        try
+        {
+            Il2CppArrayBase<TMP_Text> texts = Object.FindObjectsOfType<TMP_Text>();
+            if (texts == null) return -1;
+
+            // Normalize card name for matching (remove spaces, hyphens, dashes)
+            string normalizedCard = cardName.Replace(" ", "").Replace("-", "").ToLowerInvariant();
+
+            for (int i = 0; i < texts.Count; i++)
+            {
+                TMP_Text tmp = texts[i];
+                if ((Object)(object)tmp == (Object)null || !((Component)tmp).gameObject.activeInHierarchy) continue;
+                if (((Graphic)tmp).color.a < 0.1f) continue;
+
+                string raw = tmp.text;
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                string text = UIHelper.StripRichText(raw.Trim());
+
+                // Look for patterns like "Drag Spider-Man to New York!" or "Play Iron Man at Monster Island"
+                string lower = text.ToLowerInvariant();
+                if (!lower.Contains("drag") && !lower.Contains("play")) continue;
+
+                // Check if the card name appears in this text
+                string normalizedText = lower.Replace(" ", "").Replace("-", "");
+                if (!normalizedText.Contains(normalizedCard)) continue;
+
+                // Extract location name — look for "to [Location]" or "at [Location]"
+                int toIdx = text.LastIndexOf(" to ", StringComparison.OrdinalIgnoreCase);
+                if (toIdx < 0) toIdx = text.LastIndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+                if (toIdx < 0) continue;
+
+                string targetLoc = text.Substring(toIdx + 4).TrimEnd('!', '.', ' ');
+                if (string.IsNullOrWhiteSpace(targetLoc)) continue;
+
+                DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                    $"Tutorial hint: play {cardName} to '{targetLoc}'");
+
+                // Match against known locations
+                string normalizedTarget = targetLoc.ToLowerInvariant().Replace(" ", "");
+                for (int li = 0; li < _locations.Count; li++)
+                {
+                    LocationView lv = _locations[li];
+                    if ((Object)(object)lv == (Object)null) continue;
+                    string locName = GetLocationName(lv);
+                    if (string.IsNullOrEmpty(locName)) continue;
+                    string normalizedLoc = locName.ToLowerInvariant().Replace(" ", "");
+                    if (normalizedLoc.Contains(normalizedTarget) || normalizedTarget.Contains(normalizedLoc))
+                    {
+                        DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                            $"Tutorial target matched: location {li} ({locName})");
+                        return li;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler",
+                "FindTutorialTargetLocation failed: " + ex.Message);
+        }
+        return -1;
+    }
+
     private void AnnounceTutorialInstruction()
     {
         if (!string.IsNullOrEmpty(_lastInstructionText))
         {
-            AnnouncementService.Instance.Announce(_lastInstructionText, AnnouncementPriority.Normal);
+            AnnouncementService.Instance.Announce(_lastInstructionText, AnnouncementPriority.High);
         }
         else
         {
-            AnnouncementService.Instance.Announce(Loc.Get("bf_no_tutorial"), AnnouncementPriority.Normal);
+            // No instruction captured — try active hints as fallback
+            AnnounceActiveTutorialHints();
+        }
+
+        // Read tutorial wait state to give actionable guidance
+        try
+        {
+            VfxScenarioTutorialAction tutAction = UIHelper.FindComponent<VfxScenarioTutorialAction>();
+            if ((Object)(object)tutAction != (Object)null)
+            {
+                bool canDragCard = tutAction._WaitStateCanDragCard;
+                bool canEndTurn = tutAction._WaitStateCanEndTurn;
+
+                if (canDragCard)
+                {
+                    int energy = GetCurrentEnergy();
+                    if (energy >= 0 && _handCards.Count > 0)
+                    {
+                        List<string> playable = new List<string>();
+                        for (int i = 0; i < _handCards.Count; i++)
+                        {
+                            CardView card = _handCards[i];
+                            if ((Object)(object)card == (Object)null) continue;
+                            try
+                            {
+                                string name = GetCardName(card);
+                                CardValueView costView = ((CardRenderer)card)._CostValueView;
+                                if ((Object)(object)costView != (Object)null && costView.Value <= energy)
+                                    playable.Add(name + " (" + costView.Value + ")");
+                            }
+                            catch { }
+                        }
+                        if (playable.Count > 0)
+                        {
+                            AnnouncementService.Instance.Announce(
+                                "Energy " + energy + ". Playable: " + string.Join(", ", playable),
+                                AnnouncementPriority.Normal);
+                        }
+                        else
+                        {
+                            AnnouncementService.Instance.Announce(
+                                Loc.Get("bf_tutorial_end_turn_hint"), AnnouncementPriority.Normal);
+                        }
+                    }
+                }
+                else if (canEndTurn)
+                {
+                    AnnouncementService.Instance.Announce(
+                        Loc.Get("bf_tutorial_end_turn_hint"), AnnouncementPriority.Normal);
+                }
+                else
+                {
+                    AnnouncementService.Instance.Announce(
+                        Loc.Get("bf_tap_to_continue"), AnnouncementPriority.Normal);
+                }
+                return;
+            }
+        }
+        catch { }
+
+        // Non-tutorial: show energy and playable cards
+        int e = GetCurrentEnergy();
+        if (e >= 0 && _handCards.Count > 0)
+        {
+            List<string> playable = new List<string>();
+            for (int i = 0; i < _handCards.Count; i++)
+            {
+                CardView card = _handCards[i];
+                if ((Object)(object)card == (Object)null) continue;
+                try
+                {
+                    string name = GetCardName(card);
+                    CardValueView costView = ((CardRenderer)card)._CostValueView;
+                    if ((Object)(object)costView != (Object)null && costView.Value <= e)
+                        playable.Add(name + " (" + costView.Value + ")");
+                }
+                catch { }
+            }
+            if (playable.Count > 0)
+            {
+                AnnouncementService.Instance.Announce(
+                    "Energy " + e + ". Playable: " + string.Join(", ", playable),
+                    AnnouncementPriority.Normal);
+            }
+            else
+            {
+                AnnouncementService.Instance.Announce(Loc.Get("bf_no_playable_cards"), AnnouncementPriority.Normal);
+            }
         }
     }
 
@@ -4333,6 +5231,15 @@ public class BattlefieldHandler : IScreenNavigator
         _isPlayerTurn = false;
         _turnPhaseAnnounced = false;
         _lastTurnPhaseCheck = 0f;
+        _trackedCurrentEnergy = -1;
+        _trackedDefaultEnergy = -1;
+        _lastAutoTurnAnnouncedTurn = "";
+        _ironManPlayed = false;
+        _lastDetectedTurnText = "";
+
+        // Cooldown: suppress tutorial text scanning for a few seconds at game start
+        // so the game-start announcement doesn't get cut off by tutorial texts
+        _tutorialAdvanceCooldownUntil = Time.time + 4.0f;
 
         // Read opponent name and announce game start
         string opponentName = ReadOpponentName();
@@ -4498,7 +5405,6 @@ public class BattlefieldHandler : IScreenNavigator
     {
         DebugLogger.Log(LogCategory.State, "BattlefieldHandler", "Game left");
         // AccessStateManager removed — state is now tracked by NavigatorManager
-        _handZone = null;
         _handCards.Clear();
         _locations.Clear();
         _selectedCard = null;
@@ -4525,6 +5431,7 @@ public class BattlefieldHandler : IScreenNavigator
         _turnChangeCount = 0;
         _turnGate.Reset();
         _opponentNameAnnounced = false;
+        _cardTextCache.Clear();
     }
 
     private string GetCardName(CardView card)
@@ -4618,10 +5525,31 @@ public class BattlefieldHandler : IScreenNavigator
         return string.Join(", ", parts);
     }
 
-    /// <summary>Get the card's ability/description text — tries CardRenderer._AbilityText, then child TMP_Text search.</summary>
+    // Card text cache: avoid expensive Unity transform lookups for ability text
+    private static readonly Dictionary<string, string> _cardTextCache = new Dictionary<string, string>();
+
+    /// <summary>Get the card's ability/description text — cached by card name. Tries CardRenderer._AbilityText, then child TMP_Text search.</summary>
     private string GetCardAbilityText(CardView card)
     {
         if ((Object)(object)card == (Object)null) return "";
+
+        // Check cache first
+        string cardName = GetCardName(card);
+        if (!string.IsNullOrEmpty(cardName) && cardName != "Unknown card" &&
+            _cardTextCache.TryGetValue(cardName, out string cached))
+        {
+            return cached;
+        }
+
+        string result = GetCardAbilityTextUncached(card, cardName);
+        // Cache non-empty results
+        if (!string.IsNullOrEmpty(result) && !string.IsNullOrEmpty(cardName) && cardName != "Unknown card")
+            _cardTextCache[cardName] = result;
+        return result;
+    }
+
+    private string GetCardAbilityTextUncached(CardView card, string cardName)
+    {
 
         // Try 1: Find "Ability Text" TMP_Text under AbilityTextRoot/CardAbilityText hierarchy
         // This is the game's standard path for ability text display
@@ -4663,7 +5591,6 @@ public class BattlefieldHandler : IScreenNavigator
             Il2CppArrayBase<TMP_Text> texts = ((Component)card).GetComponentsInChildren<TMP_Text>(true);
             if (texts != null)
             {
-                string cardName = GetCardName(card);
                 for (int i = 0; i < texts.Count; i++)
                 {
                     TMP_Text tmp = texts[i];
@@ -4790,6 +5717,10 @@ public class BattlefieldHandler : IScreenNavigator
 
     private string GetEnergyText()
     {
+        // Prefer tracked value from Harmony patch — always up to date
+        if (_trackedCurrentEnergy >= 0 && _trackedDefaultEnergy >= 0)
+            return $"{_trackedCurrentEnergy}/{_trackedDefaultEnergy}";
+
         try
         {
             EnergyView ev = UIHelper.FindComponent<EnergyView>();

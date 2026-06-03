@@ -12,7 +12,7 @@ namespace SnapAccess;
 /// </summary>
 public static class UpdateChecker
 {
-    private const string CurrentVersion = "0.5.0";
+    private const string CurrentVersion = "0.6";
     private const string GitHubApiUrl = "https://api.github.com/repos/{owner}/{repo}/releases/latest";
 
     // Set these to the actual GitHub repo when published

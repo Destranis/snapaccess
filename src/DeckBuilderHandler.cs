@@ -46,6 +46,30 @@ public class DeckBuilderHandler : IScreenNavigator
     private const float CollectionScanInterval = 1.5f;
     private GameObject _editorRoot = null;
 
+    private bool _requestedCollection = false;
+    private bool _activated = false;
+    private int _detailLevel = 0; // 0=name, 1=cost, 2=power, 3=ability (battlefield pattern)
+
+    /// <summary>Called by MainMenuHandler to activate the deck builder and set starting area.</summary>
+    public void Activate(bool startInCollection)
+    {
+        _activated = true;
+        _requestedCollection = startInCollection;
+        _entryAnnounced = false;
+        _forceRescan = true;
+        _lastScanTime = 0f;
+        _lastCollectionScanTime = 0f;
+        _editorRoot = null;
+        DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler",
+            $"Activated, startInCollection={startInCollection}");
+    }
+
+    /// <summary>Called by MainMenuHandler to set which area the deck builder should start in.</summary>
+    public void RequestStartArea(bool startInCollection)
+    {
+        _requestedCollection = startInCollection;
+    }
+
     private class DeckCardEntry
     {
         public string Name = "Unknown";
@@ -58,16 +82,23 @@ public class DeckBuilderHandler : IScreenNavigator
     }
 
     public string NavigatorId => "DeckBuilder";
-    public int Priority => 650;
+    public int Priority => 0; // Managed directly by MainMenuHandler, not by NavigatorManager priority
     public bool IsActive => _isActive;
 
     public void Update()
     {
+        if (!_activated)
+        {
+            if (_isActive) { _isActive = false; Deactivate(); }
+            return;
+        }
+
         if (!ScanForDeckEditor())
         {
             if (_isActive)
             {
                 _isActive = false;
+                _activated = false;
                 Deactivate();
             }
             return;
@@ -77,7 +108,22 @@ public class DeckBuilderHandler : IScreenNavigator
         if (!_entryAnnounced)
         {
             _entryAnnounced = true;
-            AnnouncementService.Instance.Announce(Loc.Get("deck_builder_entry", _deckName, _deckCards.Count), AnnouncementPriority.High);
+            // Apply requested starting area
+            if (_requestedCollection)
+            {
+                _currentArea = Area.CollectionCards;
+                ScanCollectionCards();
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("deck_builder_entry", _deckName, _deckCards.Count) + " " +
+                    Loc.Get("deck_builder_area_collection", _collectionCards.Count), AnnouncementPriority.High);
+            }
+            else
+            {
+                _currentArea = Area.DeckCards;
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("deck_builder_entry", _deckName, _deckCards.Count), AnnouncementPriority.High);
+            }
+            _requestedCollection = false;
         }
         ProcessInput();
     }
@@ -85,6 +131,7 @@ public class DeckBuilderHandler : IScreenNavigator
     public void Deactivate()
     {
         _isActive = false;
+        _activated = false;
         _entryAnnounced = false;
         _forceRescan = false;
         _currentArea = Area.DeckCards;
@@ -96,6 +143,7 @@ public class DeckBuilderHandler : IScreenNavigator
     public void OnSceneChanged(string sceneName)
     {
         _isActive = false;
+        _activated = false;
         _entryAnnounced = false;
         _forceRescan = false;
         _currentArea = Area.DeckCards;
@@ -110,48 +158,79 @@ public class DeckBuilderHandler : IScreenNavigator
     }
 
     /// <summary>
-    /// Detects whether the deck editor is open by looking for known
-    /// game components: CollectionDeckTrayView (deck tray) or a
-    /// DeckListView with active DeckListCardSlotViews.
+    /// Detects whether the deck editor is open by looking for Grid_CardSlots
+    /// (the container of DeckCardSlotCell children in the landscape deck editor).
+    /// Avoids Il2Cpp generic component lookups that can silently fail.
     /// </summary>
     private bool ScanForDeckEditor()
     {
         if (!_forceRescan && Time.time - _lastScanTime < ScanInterval) return _isActive;
-        _forceRescan = false;
         _lastScanTime = Time.time;
 
         try
         {
-            // The deck editor is open when DeckListCardSlotView components exist and are active.
-            // CollectionDeckDetailsView.IsShowing() can be true in view mode too (false positive).
-            // So we require actual deck slot views to confirm we're in edit mode.
-            Il2CppArrayBase<DeckListCardSlotView> slotViews = Object.FindObjectsOfType<DeckListCardSlotView>();
-            if (slotViews == null || slotViews.Length == 0) return false;
-
-            // Verify at least one slot is active in the hierarchy
-            bool hasActiveSlot = false;
-            for (int i = 0; i < slotViews.Length; i++)
+            // Strategy 1: Find Grid_CardSlots directly (proven path from UI dump)
+            GameObject gridSlots = GameObject.Find("Grid_CardSlots");
+            if (gridSlots != null && gridSlots.activeInHierarchy)
             {
-                if (slotViews[i] != null && ((Component)slotViews[i]).gameObject.activeInHierarchy)
+                _editorRoot = gridSlots;
+                _forceRescan = false;
+                DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler",
+                    "Found Grid_CardSlots directly");
+                ScanDeckCards();
+                return true;
+            }
+
+            // Strategy 2: Find DeckCardSlotLIst (parent of Grid_CardSlots)
+            GameObject slotList = GameObject.Find("DeckCardSlotLIst");
+            if (slotList != null && slotList.activeInHierarchy)
+            {
+                // Try to find Grid_CardSlots as child
+                Transform grid = UIHelper.FindChildByName(slotList.transform, "Grid_CardSlots");
+                if (grid != null)
                 {
-                    hasActiveSlot = true;
-                    break;
+                    _editorRoot = grid.gameObject;
+                    _forceRescan = false;
+                    DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler",
+                        "Found Grid_CardSlots via DeckCardSlotLIst");
+                    ScanDeckCards();
+                    return true;
                 }
+                // Use DeckCardSlotLIst itself
+                _editorRoot = slotList;
+                _forceRescan = false;
+                ScanDeckCards();
+                return true;
             }
-            if (!hasActiveSlot) return false;
 
-            // Find the editor root for deck name reading
-            if (_editorRoot == null)
+            // Strategy 3: Find DeckEditSection container
+            GameObject deckEditSection = GameObject.Find("DeckEditSection");
+            if (deckEditSection == null) deckEditSection = GameObject.Find("DeckEditSectionContainer");
+            if (deckEditSection != null && deckEditSection.activeInHierarchy)
             {
-                var detailsView = Object.FindObjectOfType<Il2CppCubeUnity.App.Collection.CollectionDeckDetailsView>();
-                if (detailsView != null && ((Component)detailsView).gameObject.activeInHierarchy)
-                    _editorRoot = ((Component)detailsView).gameObject;
-                else
-                    _editorRoot = ((Component)slotViews[0]).gameObject;
+                // Search for Grid_CardSlots within it
+                Transform grid = UIHelper.FindChildByName(deckEditSection.transform, "Grid_CardSlots");
+                if (grid != null)
+                {
+                    _editorRoot = grid.gameObject;
+                    _forceRescan = false;
+                    DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler",
+                        "Found Grid_CardSlots under DeckEditSection");
+                    ScanDeckCards();
+                    return true;
+                }
+                // Use DeckEditSection as root even without Grid_CardSlots
+                _editorRoot = deckEditSection;
+                _forceRescan = false;
+                ScanDeckCards();
+                if (_deckCards.Count > 0) return true;
             }
 
-            ScanDeckCards();
-            return true;
+            // Keep _forceRescan true if we haven't found anything yet,
+            // so next frame tries again immediately
+            DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler",
+                "ScanForDeckEditor: no deck editor found");
+            return false;
         }
         catch (Exception ex)
         {
@@ -161,8 +240,8 @@ public class DeckBuilderHandler : IScreenNavigator
     }
 
     /// <summary>
-    /// Scans deck cards from DeckListCardSlotView components.
-    /// These represent the 12 card slots in the current deck being edited.
+    /// Scans deck cards from DeckCardSlotCell buttons under the editor root,
+    /// with fallback to DeckListCardSlotView components.
     /// </summary>
     private void ScanDeckCards()
     {
@@ -177,105 +256,87 @@ public class DeckBuilderHandler : IScreenNavigator
                 _deckName = ReadDeckName(_editorRoot);
             }
 
-            // Find all DeckListCardSlotView instances
-            Il2CppArrayBase<DeckListCardSlotView> slotViews = Object.FindObjectsOfType<DeckListCardSlotView>();
-            if (slotViews == null || slotViews.Length == 0)
-            {
-                // Fallback: scan for CardRenderers under known containers
-                ScanDeckCardsFallback();
-                return;
-            }
-
             HashSet<string> seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            for (int i = 0; i < slotViews.Length; i++)
+            // Strategy 1: Find DeckCardSlotCell buttons under editor root
+            // _editorRoot may BE Grid_CardSlots itself, or a parent containing it
+            if (_editorRoot != null)
             {
-                try
+                Transform gridSlots = _editorRoot.transform;
+                // If _editorRoot is not Grid_CardSlots itself, search for it
+                if (!_editorRoot.name.Contains("Grid_CardSlots"))
                 {
-                    DeckListCardSlotView slot = slotViews[i];
-                    if (slot == null || !((Component)slot).gameObject.activeInHierarchy) continue;
+                    Transform found = UIHelper.FindChildByName(_editorRoot.transform, "Grid_CardSlots");
+                    if (found == null) found = UIHelper.FindChildByName(_editorRoot.transform, "DeckCardSlotLIst");
+                    if (found != null) gridSlots = found;
+                }
 
-                    // Check if this slot belongs to the deck list area
-                    // (not the collection area — deck cards are typically fewer and in a specific container)
-                    string path = UIHelper.GetGameObjectPath(((Component)slot).gameObject);
-                    if (path.Contains("Collection") && !path.Contains("DeckList") && !path.Contains("DeckSlot"))
-                        continue;
-
-                    DeckCardEntry entry = new DeckCardEntry();
-                    entry.GameObject = ((Component)slot).gameObject;
-                    entry.Button = ((Component)slot).GetComponentInChildren<Button>();
-
-                    // Try to get card name from the slot's Card property
+                for (int i = 0; i < gridSlots.childCount; i++)
+                {
                     try
                     {
-                        var card = slot.Card;
-                        if (card != null)
-                        {
-                            // Card has a CardDefId we can use
-                            try
-                            {
-                                string defId = card.CardDefId.ToString();
-                                if (!string.IsNullOrEmpty(defId) && defId != "0")
-                                    entry.Name = UIHelper.StripRichText(defId);
-                            }
-                            catch { }
-                        }
+                        Transform slotCell = gridSlots.GetChild(i);
+                        if (slotCell == null || !slotCell.gameObject.activeInHierarchy) continue;
+                        if (!slotCell.name.Contains("DeckCardSlotCell")) continue;
+
+                        // Find CardRenderer in this slot
+                        CardRenderer cr = slotCell.GetComponentInChildren<CardRenderer>(false);
+                        if (cr == null) continue;
+
+                        DeckCardEntry entry = new DeckCardEntry();
+                        entry.Renderer = cr;
+                        entry.GameObject = slotCell.gameObject;
+                        // The clickable button is the LandscapeCollectionCardView
+                        entry.Button = slotCell.GetComponentInChildren<Button>(false);
+                        ReadCardRendererData(entry);
+
+                        if (entry.Name == "Unknown" || entry.Name == "Card") continue;
+                        if (seenNames.Contains(entry.Name)) continue;
+                        seenNames.Add(entry.Name);
+                        _deckCards.Add(entry);
                     }
                     catch { }
+                }
+            }
 
-                    // Try CardView -> CardRenderer for name, cost, power
-                    try
-                    {
-                        var cardView = slot.CardView;
-                        if (cardView != null)
-                        {
-                            entry.Renderer = (CardRenderer)cardView;
-                            ReadCardRendererData(entry);
-                        }
-                    }
-                    catch { }
-
-                    // Fallback: check for CardRenderer directly on children
-                    if (entry.Name == "Unknown" || entry.Name == "Card")
+            // Strategy 2: DeckListCardSlotView components (fallback for older UI)
+            if (_deckCards.Count == 0)
+            {
+                Il2CppArrayBase<DeckListCardSlotView> slotViews = Object.FindObjectsOfType<DeckListCardSlotView>();
+                if (slotViews != null)
+                {
+                    for (int i = 0; i < slotViews.Length; i++)
                     {
                         try
                         {
+                            DeckListCardSlotView slot = slotViews[i];
+                            if (slot == null || !((Component)slot).gameObject.activeInHierarchy) continue;
+
+                            DeckCardEntry entry = new DeckCardEntry();
+                            entry.GameObject = ((Component)slot).gameObject;
+                            entry.Button = ((Component)slot).GetComponentInChildren<Button>();
+
+                            // Try CardRenderer
                             CardRenderer cr = ((Component)slot).GetComponentInChildren<CardRenderer>();
                             if (cr != null)
                             {
                                 entry.Renderer = cr;
                                 ReadCardRendererData(entry);
                             }
+
+                            if (entry.Name == "Unknown" || entry.Name == "Card") continue;
+                            if (seenNames.Contains(entry.Name)) continue;
+                            seenNames.Add(entry.Name);
+                            _deckCards.Add(entry);
                         }
                         catch { }
                     }
-
-                    // Fallback: TMP_Text child named "Text_Name"
-                    if (entry.Name == "Unknown" || entry.Name == "Card")
-                    {
-                        try
-                        {
-                            TMP_Text nameText = UIHelper.FindChildByName(((Component)slot).transform, "Text_Name")
-                                ?.GetComponent<TMP_Text>();
-                            if (nameText != null)
-                            {
-                                string t = UIHelper.StripRichText(nameText.text);
-                                if (!string.IsNullOrEmpty(t) && t.Length > 1)
-                                    entry.Name = t;
-                            }
-                        }
-                        catch { }
-                    }
-
-                    // Skip empty or duplicate slots
-                    if (entry.Name == "Unknown" || entry.Name == "Card") continue;
-                    if (seenNames.Contains(entry.Name)) continue;
-                    seenNames.Add(entry.Name);
-
-                    _deckCards.Add(entry);
                 }
-                catch { }
             }
+
+            // Strategy 3: CardRenderers under deck containers
+            if (_deckCards.Count == 0)
+                ScanDeckCardsFallback();
 
             // Sort by name for consistent browsing
             _deckCards.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
@@ -373,7 +434,9 @@ public class DeckBuilderHandler : IScreenNavigator
 
                     string path = UIHelper.GetGameObjectPath(((Component)cr).gameObject);
                     // Exclude deck list cards (they are in the deck area, not collection)
-                    if (path.Contains("DeckList") || path.Contains("DeckSlot")) continue;
+                    if (path.Contains("DeckList") || path.Contains("DeckSlot") ||
+                        path.Contains("DeckCard") || path.Contains("Grid_CardSlots") ||
+                        path.Contains("ObjectPool")) continue;
 
                     DeckCardEntry entry = new DeckCardEntry();
                     entry.Renderer = cr;
@@ -402,7 +465,9 @@ public class DeckBuilderHandler : IScreenNavigator
                         if (btn == null || !((Component)btn).gameObject.activeInHierarchy) continue;
 
                         string path = UIHelper.GetGameObjectPath(((Component)btn).gameObject);
-                        if (path.Contains("DeckList") || path.Contains("DeckSlot")) continue;
+                        if (path.Contains("DeckList") || path.Contains("DeckSlot") ||
+                            path.Contains("DeckCard") || path.Contains("Grid_CardSlots") ||
+                            path.Contains("ObjectPool")) continue;
                         if (!path.Contains("Collection") && !path.Contains("Card")) continue;
 
                         CardRenderer cr = ((Component)btn).GetComponentInChildren<CardRenderer>();
@@ -502,6 +567,7 @@ public class DeckBuilderHandler : IScreenNavigator
         if (SDLInput.IsKeyDown(SDLInput.Key.Tab) || SDLInput.IsButtonDown(SDLInput.GamepadButton.L1))
         {
             _currentArea = _currentArea == Area.DeckCards ? Area.CollectionCards : Area.DeckCards;
+            _detailLevel = 0;
             if (_currentArea == Area.CollectionCards)
             {
                 ScanCollectionCards();
@@ -536,6 +602,13 @@ public class DeckBuilderHandler : IScreenNavigator
             return;
         }
 
+        // H: Help
+        if (SDLInput.IsKeyDown(SDLInput.Key.H))
+        {
+            AnnounceContext();
+            return;
+        }
+
         if (_currentArea == Area.DeckCards)
             HandleDeckCardsInput();
         else
@@ -555,35 +628,47 @@ public class DeckBuilderHandler : IScreenNavigator
             return;
         }
 
-        if (_holdRepeater.Check(SDLInput.Key.Left, () => { _deckCardIndex = (_deckCardIndex - 1 + _deckCards.Count) % _deckCards.Count; AnnounceDeckCard(); })) { }
+        if (_holdRepeater.Check(SDLInput.Key.Left, () => { _deckCardIndex = (_deckCardIndex - 1 + _deckCards.Count) % _deckCards.Count; _detailLevel = 0; AnnounceDeckCard(); })) { }
         else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
         {
             _deckCardIndex = (_deckCardIndex - 1 + _deckCards.Count) % _deckCards.Count;
+            _detailLevel = 0;
             AnnounceDeckCard();
         }
-        else if (_holdRepeater.Check(SDLInput.Key.Right, () => { _deckCardIndex = (_deckCardIndex + 1) % _deckCards.Count; AnnounceDeckCard(); })) { }
+        else if (_holdRepeater.Check(SDLInput.Key.Right, () => { _deckCardIndex = (_deckCardIndex + 1) % _deckCards.Count; _detailLevel = 0; AnnounceDeckCard(); })) { }
         else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
         {
             _deckCardIndex = (_deckCardIndex + 1) % _deckCards.Count;
+            _detailLevel = 0;
             AnnounceDeckCard();
         }
-        else if (TryLetterJumpDeck()) { }
+        else if (TryLetterJumpDeck()) { _detailLevel = 0; }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Home))
         {
-            _deckCardIndex = 0; AnnounceDeckCard();
+            _deckCardIndex = 0; _detailLevel = 0; AnnounceDeckCard();
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.End))
         {
-            _deckCardIndex = _deckCards.Count - 1; AnnounceDeckCard();
+            _deckCardIndex = _deckCards.Count - 1; _detailLevel = 0; AnnounceDeckCard();
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
         {
-            // Read full card details
-            AnnounceDeckCardDetails();
+            _detailLevel++;
+            InspectCurrentCard(_deckCards, _deckCardIndex);
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
+        {
+            if (_detailLevel > 0)
+            {
+                _detailLevel--;
+                if (_detailLevel == 0)
+                    AnnounceDeckCard();
+                else
+                    InspectCurrentCard(_deckCards, _deckCardIndex);
+            }
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
         {
-            // Click the card to remove it from deck
             RemoveCard(_deckCardIndex);
         }
     }
@@ -604,30 +689,44 @@ public class DeckBuilderHandler : IScreenNavigator
             return;
         }
 
-        if (_holdRepeater.Check(SDLInput.Key.Left, () => { _collectionIndex = (_collectionIndex - 1 + _collectionCards.Count) % _collectionCards.Count; AnnounceCollectionCard(); })) { }
+        if (_holdRepeater.Check(SDLInput.Key.Left, () => { _collectionIndex = (_collectionIndex - 1 + _collectionCards.Count) % _collectionCards.Count; _detailLevel = 0; AnnounceCollectionCard(); })) { }
         else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadLeft))
         {
             _collectionIndex = (_collectionIndex - 1 + _collectionCards.Count) % _collectionCards.Count;
+            _detailLevel = 0;
             AnnounceCollectionCard();
         }
-        else if (_holdRepeater.Check(SDLInput.Key.Right, () => { _collectionIndex = (_collectionIndex + 1) % _collectionCards.Count; AnnounceCollectionCard(); })) { }
+        else if (_holdRepeater.Check(SDLInput.Key.Right, () => { _collectionIndex = (_collectionIndex + 1) % _collectionCards.Count; _detailLevel = 0; AnnounceCollectionCard(); })) { }
         else if (SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadRight))
         {
             _collectionIndex = (_collectionIndex + 1) % _collectionCards.Count;
+            _detailLevel = 0;
             AnnounceCollectionCard();
         }
-        else if (TryLetterJumpCollection()) { }
+        else if (TryLetterJumpCollection()) { _detailLevel = 0; }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Home))
         {
-            _collectionIndex = 0; AnnounceCollectionCard();
+            _collectionIndex = 0; _detailLevel = 0; AnnounceCollectionCard();
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.End))
         {
-            if (_collectionCards.Count > 0) { _collectionIndex = _collectionCards.Count - 1; AnnounceCollectionCard(); }
+            if (_collectionCards.Count > 0) { _collectionIndex = _collectionCards.Count - 1; _detailLevel = 0; AnnounceCollectionCard(); }
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Down) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadDown))
         {
-            AnnounceCollectionCardDetails();
+            _detailLevel++;
+            InspectCurrentCard(_collectionCards, _collectionIndex);
+        }
+        else if (SDLInput.IsKeyDown(SDLInput.Key.Up) || SDLInput.IsButtonDown(SDLInput.GamepadButton.DPadUp))
+        {
+            if (_detailLevel > 0)
+            {
+                _detailLevel--;
+                if (_detailLevel == 0)
+                    AnnounceCollectionCard();
+                else
+                    InspectCurrentCard(_collectionCards, _collectionIndex);
+            }
         }
         else if (SDLInput.IsKeyDown(SDLInput.Key.Return) || SDLInput.IsButtonDown(SDLInput.GamepadButton.South))
         {
@@ -639,7 +738,8 @@ public class DeckBuilderHandler : IScreenNavigator
     {
         if (_deckCardIndex < 0 || _deckCardIndex >= _deckCards.Count) return;
         var card = _deckCards[_deckCardIndex];
-        string msg = Loc.Get("deck_builder_deck_card", card.Name, _deckCardIndex + 1, _deckCards.Count);
+        string costPower = FormatCostPower(card);
+        string msg = card.Name + costPower + ", " + (_deckCardIndex + 1) + " of " + _deckCards.Count;
         AnnouncementService.Instance.Announce(msg);
     }
 
@@ -655,7 +755,13 @@ public class DeckBuilderHandler : IScreenNavigator
     {
         if (_collectionIndex < 0 || _collectionIndex >= _collectionCards.Count) return;
         var card = _collectionCards[_collectionIndex];
-        string msg = Loc.Get("deck_builder_collection_card", card.Name, _collectionIndex + 1, _collectionCards.Count);
+        string costPower = FormatCostPower(card);
+        // Check if already in deck
+        bool inDeck = false;
+        foreach (var dc in _deckCards)
+            if (dc.Name.Equals(card.Name, StringComparison.OrdinalIgnoreCase)) { inDeck = true; break; }
+        string deckStatus = inDeck ? " (" + Loc.Get("deck_builder_in_deck") + ")" : "";
+        string msg = card.Name + costPower + deckStatus + ", " + (_collectionIndex + 1) + " of " + _collectionCards.Count;
         AnnouncementService.Instance.Announce(msg);
     }
 
@@ -665,6 +771,51 @@ public class DeckBuilderHandler : IScreenNavigator
         var card = _collectionCards[_collectionIndex];
         string details = FormatCardDetails(card);
         AnnouncementService.Instance.Announce(details + ". " + Loc.Get("deck_builder_add_hint"));
+    }
+
+    /// <summary>Card detail levels matching battlefield: 1=cost, 2=power, 3=ability.</summary>
+    private void InspectCurrentCard(List<DeckCardEntry> cards, int index)
+    {
+        if (index < 0 || index >= cards.Count) return;
+        var card = cards[index];
+
+        switch (_detailLevel)
+        {
+            case 1: // Cost
+                if (card.Cost >= 0)
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_cost", card.Cost.ToString()));
+                else
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_cost_unknown"));
+                break;
+            case 2: // Power
+                if (card.Power >= 0)
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_power", card.Power.ToString()));
+                else
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_power_unknown"));
+                break;
+            case 3: // Ability
+                if (!string.IsNullOrEmpty(card.Ability))
+                    AnnouncementService.Instance.Announce(card.Ability);
+                else
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_ability"));
+                break;
+            default:
+                _detailLevel = 3;
+                if (!string.IsNullOrEmpty(card.Ability))
+                    AnnouncementService.Instance.Announce(card.Ability);
+                else
+                    AnnouncementService.Instance.Announce(Loc.Get("bf_detail_no_ability"));
+                break;
+        }
+    }
+
+    /// <summary>Brief cost/power for browse announcements.</summary>
+    private string FormatCostPower(DeckCardEntry card)
+    {
+        string result = "";
+        if (card.Cost >= 0) result += ", " + card.Cost + " cost";
+        if (card.Power >= 0) result += ", " + card.Power + " power";
+        return result;
     }
 
     private string FormatCardDetails(DeckCardEntry card)
@@ -677,7 +828,7 @@ public class DeckBuilderHandler : IScreenNavigator
     }
 
     /// <summary>
-    /// Clicks a card in the deck to remove it.
+    /// Removes a card from the deck by clicking it via SDButton.Click().
     /// In Marvel Snap's deck editor, clicking a card in the deck removes it.
     /// </summary>
     private void RemoveCard(int index)
@@ -688,19 +839,20 @@ public class DeckBuilderHandler : IScreenNavigator
         try
         {
             bool clicked = false;
-            // Try all click methods: SendPointerClick first (most reliable for custom UI),
-            // then ClickButton, then mouse simulation
+
+            // SDButton.Click() — Snap's native button activation
             if (card.GameObject != null)
-                clicked = UIHelper.SendPointerClick(card.GameObject);
+                clicked = UIHelper.ActivateButton(card.GameObject);
+
+            // Fallback: try the button directly
             if (!clicked && card.Button != null)
-                clicked = UIHelper.ClickButtonWithFallback(card.Button);
-            if (!clicked && card.GameObject != null)
-                clicked = UIHelper.SimulateMouseClick(card.GameObject);
+                clicked = UIHelper.ActivateButton(card.Button);
 
             if (clicked)
             {
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("deck_builder_removed", card.Name));
-                AnnouncementService.Instance.Announce($"{_deckCards.Count - 1} of 12", AnnouncementPriority.Low);
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("deck_builder_card_count", _deckCards.Count - 1), AnnouncementPriority.Low);
                 DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler", $"Removed card: {card.Name}");
             }
             else
@@ -720,30 +872,38 @@ public class DeckBuilderHandler : IScreenNavigator
     }
 
     /// <summary>
-    /// Clicks a card in the collection to add it to the deck.
+    /// Adds a card from the collection to the deck by clicking it via SDButton.Click().
     /// In Marvel Snap's deck editor, clicking a collection card adds it.
     /// </summary>
     private void AddCard(int index)
     {
         if (index < 0 || index >= _collectionCards.Count) return;
+
+        if (_deckCards.Count >= 12)
+        {
+            AnnouncementService.Instance.Announce(Loc.Get("deck_builder_deck_full"));
+            return;
+        }
+
         var card = _collectionCards[index];
 
         try
         {
             bool clicked = false;
-            // Try all click methods: SendPointerClick first (most reliable for custom UI),
-            // then ClickButton, then mouse simulation
+
+            // SDButton.Click() — Snap's native button activation
             if (card.GameObject != null)
-                clicked = UIHelper.SendPointerClick(card.GameObject);
+                clicked = UIHelper.ActivateButton(card.GameObject);
+
+            // Fallback: try the button directly
             if (!clicked && card.Button != null)
-                clicked = UIHelper.ClickButtonWithFallback(card.Button);
-            if (!clicked && card.GameObject != null)
-                clicked = UIHelper.SimulateMouseClick(card.GameObject);
+                clicked = UIHelper.ActivateButton(card.Button);
 
             if (clicked)
             {
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("deck_builder_added", card.Name));
-                AnnouncementService.Instance.Announce($"{_deckCards.Count + 1} of 12", AnnouncementPriority.Low);
+                AnnouncementService.Instance.Announce(
+                    Loc.Get("deck_builder_card_count", _deckCards.Count + 1), AnnouncementPriority.Low);
                 DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler", $"Added card: {card.Name}");
             }
             else
@@ -772,7 +932,7 @@ public class DeckBuilderHandler : IScreenNavigator
             Button saveBtn = FindButtonByNames("btn_save", "SaveButton", "btn_done", "DoneButton", "ConfirmButton");
             if (saveBtn != null)
             {
-                UIHelper.ClickButton(saveBtn);
+                UIHelper.ActivateButton(saveBtn);
                 AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("deck_builder_saving"));
                 DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler", "Save button clicked");
                 return;
@@ -793,7 +953,7 @@ public class DeckBuilderHandler : IScreenNavigator
                             || label.Contains("Done", StringComparison.OrdinalIgnoreCase)
                             || label.Contains("Confirm", StringComparison.OrdinalIgnoreCase)))
                         {
-                            UIHelper.ClickButton(btn);
+                            UIHelper.ActivateButton(btn);
                             AnnouncementService.Instance.AnnounceInterrupt(Loc.Get("deck_builder_saving"));
                             return;
                         }
@@ -811,30 +971,13 @@ public class DeckBuilderHandler : IScreenNavigator
         }
     }
 
-    /// <summary>Tries to close the deck editor by finding a back/close button or simulating Escape.</summary>
+    /// <summary>Tries to close the deck editor by deactivating and returning to MainMenuHandler.</summary>
     private void TryCloseEditor()
     {
-        try
-        {
-            Button closeBtn = FindButtonByNames("btn_back", "BackButton", "btn_close", "CloseButton");
-            if (closeBtn != null)
-            {
-                UIHelper.ClickButton(closeBtn);
-                AnnouncementService.Instance.Announce(Loc.Get("deck_builder_back"));
-                DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler", "Close button clicked");
-                return;
-            }
-
-            // Fallback: simulate Escape
-            UIHelper.SimulateKeyPress(SDLInput.Key.Escape);
-            AnnouncementService.Instance.Announce(Loc.Get("deck_builder_back"));
-        }
-        catch (Exception ex)
-        {
-            UIHelper.SimulateKeyPress(SDLInput.Key.Escape);
-            AnnouncementService.Instance.Announce(Loc.Get("deck_builder_back"));
-            DebugLogger.Error($"TryCloseEditor failed: {ex.Message}");
-        }
+        _activated = false;
+        _isActive = false;
+        AnnouncementService.Instance.Announce(Loc.Get("deck_builder_back"));
+        DebugLogger.Log(LogCategory.Handler, "DeckBuilderHandler", "Closed, returning to collection");
     }
 
     /// <summary>Finds a button by checking multiple possible GameObject names.</summary>
@@ -860,10 +1003,24 @@ public class DeckBuilderHandler : IScreenNavigator
     {
         try
         {
+            // Search the DeckEditSection hierarchy for deck name
+            // root may be Grid_CardSlots — walk up to find the broader context
+            GameObject searchRoot = root;
+            Transform parent = root.transform;
+            while (parent != null)
+            {
+                if (parent.name.Contains("DeckEditSection") || parent.name.Contains("CollectionDeckDetailsView"))
+                {
+                    searchRoot = parent.gameObject;
+                    break;
+                }
+                parent = parent.parent;
+            }
+
             // Look for a Text_Name or DeckName TMP element
-            Transform nameTransform = UIHelper.FindChildByName(root.transform, "Text_Name")
-                ?? UIHelper.FindChildByName(root.transform, "DeckName")
-                ?? UIHelper.FindChildByName(root.transform, "Text_DeckName");
+            Transform nameTransform = UIHelper.FindChildByName(searchRoot.transform, "Text_Name")
+                ?? UIHelper.FindChildByName(searchRoot.transform, "DeckName")
+                ?? UIHelper.FindChildByName(searchRoot.transform, "Text_DeckName");
 
             if (nameTransform != null)
             {
@@ -875,16 +1032,16 @@ public class DeckBuilderHandler : IScreenNavigator
                 }
             }
 
-            // Fallback: first non-trivial TMP_Text
-            TMP_Text[] texts = root.GetComponentsInChildren<TMP_Text>();
-            if (texts != null)
+            // Also try finding it via global search
+            GameObject nameGo = GameObject.Find("Text_Name");
+            if (nameGo == null) nameGo = GameObject.Find("DeckName");
+            if (nameGo != null)
             {
-                foreach (var text in texts)
+                TMP_Text text = nameGo.GetComponent<TMP_Text>();
+                if (text != null)
                 {
-                    if (text == null) continue;
                     string t = UIHelper.StripRichText(text.text);
-                    if (!string.IsNullOrEmpty(t) && t.Length > 2 && !t.All(char.IsDigit))
-                        return t;
+                    if (!string.IsNullOrEmpty(t) && t.Length > 1) return t;
                 }
             }
         }
