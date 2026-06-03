@@ -95,7 +95,7 @@ public class ModSettings
             }
 
             string json = File.ReadAllText(SettingsPath);
-            ParseJson(json, settings);
+            settings = Parse(json);
             MelonLogger.Msg("Settings loaded from " + SettingsPath);
         }
         catch (Exception ex)
@@ -113,7 +113,7 @@ public class ModSettings
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
 
-            string json = ToJson();
+            string json = Serialize();
             File.WriteAllText(SettingsPath, json);
             MelonLogger.Msg("Settings saved to " + SettingsPath);
         }
@@ -123,42 +123,50 @@ public class ModSettings
         }
     }
 
-    private string ToJson()
+    /// <summary>Serializes the settings to flat, pretty-printed boolean JSON.</summary>
+    public string Serialize()
     {
-        return "{\n"
-            + $"  \"PositionCounts\": {BoolStr(PositionCounts)},\n"
-            + $"  \"VerboseCardInfo\": {BoolStr(VerboseCardInfo)},\n"
-            + $"  \"OpponentAnnouncements\": {BoolStr(OpponentAnnouncements)},\n"
-            + $"  \"AutoTurnAnnounce\": {BoolStr(AutoTurnAnnounce)},\n"
-            + $"  \"TransitionAnnouncements\": {BoolStr(TransitionAnnouncements)},\n"
-            + $"  \"TutorialMessages\": {BoolStr(TutorialMessages)}\n"
-            + "}";
+        var sb = new System.Text.StringBuilder();
+        sb.Append("{\n");
+        for (int i = 0; i < AllSettings.Count; i++)
+        {
+            SettingDef def = AllSettings[i];
+            string comma = i < AllSettings.Count - 1 ? "," : "";
+            sb.Append($"  \"{def.Key}\": {BoolStr(def.Get(this))}{comma}\n");
+        }
+        sb.Append("}");
+        return sb.ToString();
     }
 
     private static string BoolStr(bool v) => v ? "true" : "false";
 
-    private static void ParseJson(string json, ModSettings settings)
+    /// <summary>
+    /// Parses flat boolean JSON into a new <see cref="ModSettings"/>. Unknown keys
+    /// are ignored and missing keys keep their defaults. Layout-independent: works
+    /// for pretty-printed and single-line JSON alike. Not a general JSON parser —
+    /// it assumes a flat object of boolean values.
+    /// </summary>
+    public static ModSettings Parse(string json)
     {
-        // Simple key-value parser for flat boolean JSON
-        foreach (var line in json.Split('\n'))
-        {
-            string trimmed = line.Trim().TrimEnd(',');
-            if (!trimmed.Contains(':')) continue;
+        var settings = new ModSettings();
+        if (string.IsNullOrEmpty(json)) return settings;
 
-            int colonIdx = trimmed.IndexOf(':');
-            string key = trimmed.Substring(0, colonIdx).Trim().Trim('"');
-            string val = trimmed.Substring(colonIdx + 1).Trim().Trim('"').ToLower();
+        int open = json.IndexOf('{');
+        int close = json.LastIndexOf('}');
+        string body = (open >= 0 && close > open) ? json.Substring(open + 1, close - open - 1) : json;
+
+        foreach (string pair in body.Split(','))
+        {
+            int colonIdx = pair.IndexOf(':');
+            if (colonIdx < 0) continue;
+
+            string key = pair.Substring(0, colonIdx).Trim().Trim('"').Trim();
+            string val = pair.Substring(colonIdx + 1).Trim().Trim('"').Trim().ToLowerInvariant();
             bool boolVal = val == "true";
 
-            switch (key)
-            {
-                case "PositionCounts": settings.PositionCounts = boolVal; break;
-                case "VerboseCardInfo": settings.VerboseCardInfo = boolVal; break;
-                case "OpponentAnnouncements": settings.OpponentAnnouncements = boolVal; break;
-                case "AutoTurnAnnounce": settings.AutoTurnAnnounce = boolVal; break;
-                case "TransitionAnnouncements": settings.TransitionAnnouncements = boolVal; break;
-                case "TutorialMessages": settings.TutorialMessages = boolVal; break;
-            }
+            SettingDef def = AllSettings.Find(d => d.Key == key);
+            def.Set?.Invoke(settings, boolVal);
         }
+        return settings;
     }
 }

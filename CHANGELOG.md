@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Game-free `SnapAccess.Core.Tests` xUnit project covering the logic that does not need the game (`Loc`, `ModSettings`, `UpdateChecker`, `AnnouncementService`), plus a GitHub Actions CI workflow that builds and runs it.
+- `LICENSE` file (MIT), which the README already referenced.
+
+### Fixed
+- **Update checker version comparison** compared versions lexically, so `0.10.0` was treated as older than `0.9.0`, and a downgrade counted as an available update. It now compares version components numerically.
+- **Settings persistence** read the JSON line by line, so a settings file written on a single line parsed to all-default values and silently discarded the user's choices. Parsing is now independent of layout.
+- **Update checker never ran** because its target repository was never configured. It is now wired to the upstream repository on mod load.
+- **Turn-start announcement** spoke a stray "less-than" every turn ("Turn 2&lt;, energy 2, go") from turn 2 on. The turn-counter label is TMP rich text like "&lt;size=490&gt;2&lt;/size&gt; / 6", and the code split it on '/', which cut through the closing "&lt;/size&gt;" tag. Markup is now stripped before the number is parsed.
+- **Turn announcement repeated within a turn.** The battlefield detects turn changes by watching the hand count, but playing a card also changes the hand count, so the full "Turn N, energy X, go" line was re-spoken after each play (heard as "Turn 3, energy 1, go" then "Turn 3, energy 0, go"). A turn is now announced once, when its number actually changes.
+
+### Changed
+- `AnnouncementService` now takes an injectable speech-output seam and clock instead of calling the screen-reader bridge and the system clock directly. Behavior is unchanged; the two identical High/Immediate branches were collapsed into one.
 ## v0.6 — 2026-06-02
 
 ### Deck Management Overhaul

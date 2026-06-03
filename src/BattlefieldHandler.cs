@@ -134,6 +134,7 @@ public class BattlefieldHandler : IScreenNavigator
     // Opponent card detection: don't announce before the game has started properly
     private bool _gameReadyForOpponentDetection = false;
     private int _turnChangeCount = 0;
+    private readonly TurnAnnounceGate _turnGate = new TurnAnnounceGate();
     private float _opponentScanCooldownUntil = 0f; // Block scanning briefly after turn changes (animations)
 
     // Card draw tracking: EntityIds of cards that were in hand last scan
@@ -314,6 +315,7 @@ public class BattlefieldHandler : IScreenNavigator
         _gameReadyForOpponentDetection = false;
         _opponentScanCooldownUntil = 0f;
         _turnChangeCount = 0;
+        _turnGate.Reset();
         _gameOverAnnounced = false;
         _gameOverCheckTime = 0f;
         _lastPostGameCheck = 0f;
@@ -4638,11 +4640,16 @@ public class BattlefieldHandler : IScreenNavigator
             // Ultra-concise: "Turn 3, energy 3, go." — minimize speech time so user can act fast
             string msg;
             if (turnText == "FINAL")
-                msg = Loc.Get("bf_turn_start_final", energy ?? "?");
-            else if (turnText != null && turnText.Contains("/"))
             {
-                string[] split = turnText.Split('/');
-                msg = Loc.Get("bf_turn_start", split[0].Trim(), energy ?? "?");
+                if (!_turnGate.ShouldAnnounce("FINAL")) return;
+                msg = Loc.Get("bf_turn_start_final", energy ?? "?");
+            }
+            else if (turnText != null)
+            {
+                // Suppress re-announcing the same turn when the hand count changed
+                // because a card was played rather than because the turn advanced.
+                if (!_turnGate.ShouldAnnounce(turnText)) return;
+                msg = Loc.Get("bf_turn_start", turnText, energy ?? "?");
             }
             else
                 msg = Loc.Get("bf_your_turn");
@@ -4664,7 +4671,7 @@ public class BattlefieldHandler : IScreenNavigator
         }
     }
 
-    /// <summary>Gets the raw turn text (e.g. "3 / 6" or "FINAL TURN") without announcing it.</summary>
+    /// <summary>Returns the current turn number (e.g. "3"), the sentinel "FINAL", or null. Does not announce.</summary>
     private string GetTurnText()
     {
         try
@@ -4681,12 +4688,11 @@ public class BattlefieldHandler : IScreenNavigator
                 {
                     string val = t.text;
                     if (string.IsNullOrEmpty(val)) continue;
-                    val = val.Trim();
-                    // Normal format: "3 / 6"
-                    if (val.Contains("/")) return val;
-                    // Final turn: text says "FINAL TURN" or similar without a slash
-                    if (val.Contains("FINAL", StringComparison.OrdinalIgnoreCase))
-                        return "FINAL";
+                    // The label is TMP rich text such as "<size=490>2</size> / 6";
+                    // TurnTextParser strips the markup before splitting on '/' so the
+                    // closing "</size>" tag's slash can't corrupt the turn number.
+                    string current = TurnTextParser.ParseCurrent(val);
+                    if (current != null) return current;
                 }
             }
         }
@@ -5423,6 +5429,7 @@ public class BattlefieldHandler : IScreenNavigator
         _playVerifyExpectedCount = -1;
         _gameReadyForOpponentDetection = false;
         _turnChangeCount = 0;
+        _turnGate.Reset();
         _opponentNameAnnounced = false;
         _cardTextCache.Clear();
     }

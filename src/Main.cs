@@ -36,6 +36,10 @@ public class Main : MelonMod
         SDLInput.Initialize();
         Loc.Initialize();
 
+        // Check the upstream repo for a newer release (non-blocking, fire-and-forget).
+        UpdateChecker.Configure("Destranis", "snapaccess");
+        UpdateChecker.CheckAsync();
+
         InitializeNavigators();
 
         MelonCoroutines.Start(AnnounceStartupDelayed());
@@ -47,7 +51,9 @@ public class Main : MelonMod
     /// </summary>
     private void InitializeNavigators()
     {
-        _announcer = new AnnouncementService();
+        _announcer = new AnnouncementService(
+            new ScreenReaderSpeechOutput(),
+            log: msg => DebugLogger.Log(LogCategory.State, "Announce", msg));
         _navigatorManager = new NavigatorManager();
         _gameLog = new GameLogNavigator();
         _modSettings = new ModSettingsNavigator();
