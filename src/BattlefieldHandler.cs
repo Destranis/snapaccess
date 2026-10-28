@@ -3305,7 +3305,7 @@ public class BattlefieldHandler : IScreenNavigator
     {
         try
         {
-            GameView gameView = GameView.Get();
+            GameView gameView = UIHelper.FindComponent<GameView>();
             if ((Object)(object)gameView == (Object)null) return false;
 
             DebugLogger.Log(LogCategory.Handler, "BattlefieldHandler", $"Trying StageCardToLocation: {cardName} -> {locationName}");
@@ -3726,7 +3726,7 @@ public class BattlefieldHandler : IScreenNavigator
             }
 
             // Also call SendEndTurnRequest as belt-and-suspenders
-            GameView gameView = GameView.Get();
+            GameView gameView = UIHelper.FindComponent<GameView>();
             if ((Object)(object)gameView != (Object)null)
             {
                 gameView.SendEndTurnRequest(false);
@@ -5912,7 +5912,7 @@ public class BattlefieldHandler : IScreenNavigator
             // Dump GameView
             try
             {
-                GameView gameView = GameView.Get();
+                GameView gameView = UIHelper.FindComponent<GameView>();
                 DumpTypeInfo(typeof(GameView), "GameView", gameView);
             }
             catch (Exception ex)
